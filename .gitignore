@@ -1,0 +1,20 @@
+# 私密
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# 项目运行产物
+translate_cache.json
+translated.pdf
+bilingual.html
+bilingual_pages/
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db
