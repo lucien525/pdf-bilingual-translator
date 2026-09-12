@@ -634,6 +634,7 @@ def apply_translations(page, blocks, translations):
 
 
 def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
+    """生成前 n_preview 页的左右对照预览图（网页显示用，永远只看前几页）"""
     clear_dir_preview(paths["preview_dir"])
     os.makedirs(paths["preview_dir"], exist_ok=True)
 
@@ -683,20 +684,41 @@ def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
     return preview_imgs
 
 
-def make_bilingual_pdf_preview(trans_path, paths, task, n_preview=PREVIEW_PAGES):
+def make_bilingual_pdf(trans_path, paths, task, n_pages=None):
+    """
+    生成左右对照双语 PDF。
+
+    n_pages=None  → 生成【全部页】（用于最终成品 bilingual.pdf）
+    n_pages=N     → 只生成前 N 页（用于过程中小快照）
+
+    实现上用 PyMuPDF 逐页写入，内存占用恒定，不受总页数影响。
+    """
     if not os.path.exists(trans_path):
+        task.log_msg(f"⚠️ 双语 PDF 源不存在：{trans_path}")
         return
     try:
         with open(trans_path, "rb") as f:
             data = f.read()
         trans = fitz.open(stream=data, filetype="pdf")
-    except Exception:
+    except Exception as e:
+        task.log_msg(f"⚠️ 双语 PDF 打开源失败：{e}")
         return
 
     try:
         orig = fitz.open(task.src_path)
-        n = min(n_preview, len(orig), len(trans))
-        pages = []
+        orig_len = len(orig)
+        trans_len = len(trans)
+        total = min(orig_len, trans_len)
+        n = total if n_pages is None else min(n_pages, total)
+
+        if n <= 0:
+            task.log_msg(f"⚠️ 双语 PDF 无有效页（orig={orig_len}, trans={trans_len}）")
+            orig.close()
+            trans.close()
+            return
+
+        out_doc = fitz.open()
+        done_count = 0
         for i in range(n):
             if task.stop_event.is_set():
                 break
@@ -714,16 +736,45 @@ def make_bilingual_pdf_preview(trans_path, paths, task, n_preview=PREVIEW_PAGES)
                 canvas = Image.new("RGB", (o.width + gap + t.width, hh), (255, 255, 255))
                 canvas.paste(o, (0, 0))
                 canvas.paste(t, (o.width + gap, 0))
-                pages.append(canvas)
-            except Exception:
+
+                # 编码成 JPEG 字节流，直接喂给 PDF，不在内存里留 Image 对象
+                buf = io.BytesIO()
+                canvas.save(buf, "JPEG", quality=PREVIEW_JPEG_QUALITY, optimize=True)
+                img_bytes = buf.getvalue()
+                buf.close()
+
+                w, page_h = canvas.size
+                page = out_doc.new_page(width=w, height=page_h)
+                page.insert_image(fitz.Rect(0, 0, w, page_h), stream=img_bytes)
+
+                # 立即释放
+                canvas.close()
+                o.close()
+                t.close()
+                done_count += 1
+            except Exception as e:
+                task.log_msg(f"⚠️ 双语 PDF 第 {i+1} 页失败：{e}")
                 continue
+
         orig.close()
         trans.close()
-        if pages:
-            pages[0].save(paths["bilingual_pdf"], save_all=True,
-                          append_images=pages[1:], resolution=150.0)
-    except Exception:
-        pass
+
+        if done_count > 0:
+            # 先删旧文件，避免异常时留下上一版 5 页的残影
+            try:
+                if os.path.exists(paths["bilingual_pdf"]):
+                    os.remove(paths["bilingual_pdf"])
+            except Exception:
+                pass
+            out_doc.save(paths["bilingual_pdf"], deflate=True)
+            task.log_msg(f"✅ 双语 PDF 生成完成：{done_count} 页 → {os.path.basename(paths['bilingual_pdf'])}")
+        else:
+            task.log_msg(f"⚠️ 双语 PDF 生成 0 页（orig={orig_len}, trans={trans_len}, n={n}）")
+        out_doc.close()
+    except Exception as e:
+        import traceback
+        task.log_msg(f"⚠️ 双语 PDF 生成异常：{e}")
+        task.log_msg(traceback.format_exc()[:500])
 
 
 # ============================================================
@@ -803,7 +854,7 @@ def pdf_worker(task, paths, real_key, model, trial):
         try:
             task.log_msg("🖼 生成前 5 页预览……")
             task.preview_images = render_preview_only(paths["output_pdf"], paths, task)
-            make_bilingual_pdf_preview(paths["output_pdf"], paths, task)
+            make_bilingual_pdf(paths["output_pdf"], paths, task, n_pages=PREVIEW_PAGES)
             task.output_files = [paths["output_pdf"], paths["bilingual_pdf"]]
             save_state(task)
             task.log_msg(f"✅ 预览图就绪（{len(task.preview_images)} 张）")
@@ -859,7 +910,8 @@ def pdf_worker(task, paths, real_key, model, trial):
             try:
                 safe_save_pdf(doc, paths["output_pdf"])
                 task.preview_images = render_preview_only(paths["output_pdf"], paths, task)
-                make_bilingual_pdf_preview(paths["output_pdf"], paths, task)
+                # 过程小快照：只生成前 5 页，避免频繁渲染整本
+                make_bilingual_pdf(paths["output_pdf"], paths, task, n_pages=PREVIEW_PAGES)
                 task.output_files = [paths["output_pdf"], paths["bilingual_pdf"]]
                 save_state(task)
             except Exception:
@@ -884,12 +936,14 @@ def pdf_worker(task, paths, real_key, model, trial):
         save_state(task)
         return
 
+    # 收尾：生成完整预览图 + 完整双语 PDF（全部页）
     try:
+        task.log_msg("🖼 生成左右对照双语 PDF（全部已翻页，请稍候）……")
         task.preview_images = render_preview_only(paths["output_pdf"], paths, task)
-        make_bilingual_pdf_preview(paths["output_pdf"], paths, task)
+        make_bilingual_pdf(paths["output_pdf"], paths, task, n_pages=None)   # ← 全部页
         task.output_files = [paths["output_pdf"], paths["bilingual_pdf"]]
-    except Exception:
-        pass
+    except Exception as e:
+        task.log_msg(f"⚠️ 收尾生成双语 PDF 失败：{e}")
 
     if completed:
         task.status = "done"
@@ -1626,7 +1680,7 @@ with gr.Blocks(
       <div class="meta">
         <span class="k">🔑 密钥</span>留空取 <code>.env</code> 中的默认值，亦可临时填入覆盖
         <br>
-        <span class="k">📁 成果</span>归于 <code>result/&lt;文件名&gt;/</code>
+        <span class="k">📁 保存位置</span>译文存于 <code>result/&lt;文件名&gt;/</code>，点下方「📁 打开保存位置」按钮直达
         <br>
         <span class="k">📄 上传</span>拖入文件即自动识别类型（.pdf / .docx / .pptx），无需手动选。<br>
         　　　　　 下方"文档类型"选项只作参考，不影响实际处理。
@@ -1636,6 +1690,8 @@ with gr.Blocks(
         <span class="k">⏸ 停止</span>下方可<b>单独停止</b>某个任务，也可<b>一键停止全部</b>。
         <br>
         <span class="k">👀 预览</span>PDF 显示前 5 页左右对照；Word / PPT 显示前 5 段文本对照。
+        <br>
+        <span class="k">📚 成品</span><code>translated.pdf</code>（纯译文）和 <code>bilingual.pdf</code>（左右对照，<b>全部页</b>）
       </div>
     </div>
     """)
@@ -1669,7 +1725,7 @@ with gr.Blocks(
     )
     trial = gr.Checkbox(
         label="🧪 试翻模式：PDF 只翻前 5 页（对 Word / PPT 无效）",
-        value=True,
+        value=False,          # ← 默认关闭，全本翻译
         elem_id="trial_cb",
     )
 
@@ -1679,7 +1735,7 @@ with gr.Blocks(
             stop_btn = gr.Button("⏹ 停止所有任务", variant="secondary")
         with gr.Row(equal_height=True):
             refresh_btn = gr.Button("🔄 手动刷新状态", variant="secondary")
-            open_btn = gr.Button("📁 打开当前任务文件夹", variant="secondary")
+            open_btn = gr.Button("📁 打开保存位置（translated.pdf / bilingual.pdf 在此）", variant="secondary")
 
     gr.Markdown("### 📋 任务列表（最近 8 条，刷新页面后仍保留）")
     task_list_html = gr.HTML(value='<div style="padding:14px;color:#888;font-size:13px">暂无任务</div>')
