@@ -17,6 +17,7 @@ import uuid
 import io
 from dataclasses import dataclass, field
 from typing import Optional
+from html import escape
 
 import pymupdf as fitz
 try:
@@ -51,8 +52,9 @@ FONT_PATH = r"D:\file\translate\word_type\09_SourceHanSerifSC\OTF\SimplifiedChin
 RESULT_ROOT = "result"
 RENDER_ZOOM = 2.0
 PREVIEW_PAGES = 5
-PREVIEW_MAX_WIDTH = 1400         # 预览图最大宽度（越大越清晰，HTML 也越大）
-PREVIEW_JPEG_QUALITY = 88        # 预览图 JPEG 质量（1-95）
+PREVIEW_MAX_WIDTH = 1400
+PREVIEW_JPEG_QUALITY = 88
+PREVIEW_PARAS = 5
 
 _IO_LOCK = threading.Lock()
 _LAST_PREVIEW_SIG = {}
@@ -94,6 +96,7 @@ class TaskState:
     log: list = field(default_factory=list)
     output_files: list = field(default_factory=list)
     preview_images: list = field(default_factory=list)
+    preview_html: str = ""
     error: str = ""
     stop_event: threading.Event = field(default_factory=threading.Event)
     thread: Optional[threading.Thread] = None
@@ -210,7 +213,6 @@ def scan_all_states():
 
 
 def cleanup_orphan_files():
-    """清理因保存失败兜底生成的 translated_new_<时间戳>.pdf"""
     root = os.path.abspath(RESULT_ROOT)
     if not os.path.isdir(root):
         return 0
@@ -227,7 +229,6 @@ def cleanup_orphan_files():
                     print(f"   🧹 清理冗余文件：{name}/{f}")
                 except Exception:
                     pass
-            # 清理未完成的临时 PDF
             if f.endswith(".tmp.pdf"):
                 try:
                     os.remove(os.path.join(d, f))
@@ -317,7 +318,6 @@ def clear_dir_preview(folder):
 
 
 def safe_save_pdf(doc, out_path, retries=5):
-    """保存 PDF：先写临时文件，再原子替换。目标文件被占用时自动重试。"""
     tmp_path = out_path + ".tmp.pdf"
     try:
         if os.path.exists(tmp_path):
@@ -352,7 +352,6 @@ def safe_save_pdf(doc, out_path, retries=5):
 
 
 def img_to_base64_dataurl(path):
-    """把本地图片转成 base64 data URL（内嵌 HTML，避免 /file= 404）"""
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -370,7 +369,6 @@ def img_to_base64_dataurl(path):
 
 
 def preview_signature(preview_imgs):
-    """用文件名 + 修改时间作为签名，判断是否需要重建 HTML"""
     parts = []
     for p in preview_imgs or []:
         try:
@@ -380,8 +378,10 @@ def preview_signature(preview_imgs):
     return tuple(parts)
 
 
-def build_preview_html(preview_imgs):
-    """构建 PDF 式纵向滚动的预览 HTML（base64 内嵌图片）"""
+def build_preview_html(preview_imgs, preview_html=None):
+    if preview_html:
+        return preview_html
+
     if not preview_imgs:
         return '''
         <div style="padding:30px 20px;color:#888;text-align:center;font-size:13.5px;
@@ -425,6 +425,64 @@ def build_preview_html(preview_imgs):
       </div>
     </div>
     '''
+
+
+def _build_docx_preview_html(pairs):
+    if not pairs:
+        return ""
+    rows = []
+    for idx, (src, dst) in enumerate(pairs):
+        rows.append(f'''
+        <div style="background:#fff;border-radius:8px;padding:16px 18px;margin-bottom:12px;
+                    box-shadow:0 2px 10px rgba(0,0,0,.15)">
+          <div style="font-size:11px;color:#b09b63;font-weight:600;
+                      letter-spacing:.5px;margin-bottom:6px">第 {idx+1} 段 · 原文</div>
+          <div style="font-size:14px;color:#555;line-height:1.75;margin-bottom:14px">{escape(src)}</div>
+          <div style="font-size:11px;color:#b09b63;font-weight:600;
+                      letter-spacing:.5px;margin-bottom:6px">第 {idx+1} 段 · 译文</div>
+          <div style="font-size:14.5px;color:#111;line-height:1.9">{escape(dst)}</div>
+        </div>''')
+    return (
+        '<div style="background:#f5f1e6;border-radius:10px;padding:14px;'
+        'max-height:820px;overflow-y:auto;scroll-behavior:smooth">'
+        '<div style="color:#888;font-size:12px;text-align:center;'
+        'padding:6px 0 12px 0;letter-spacing:.5px">'
+        f'文本对照预览（前 {len(pairs)} 段）'
+        '</div>'
+        + "".join(rows) +
+        '<div style="color:#aaa;font-size:11px;text-align:center;padding:6px 0">'
+        '— 完整结果请下载 Word 查看 —</div>'
+        '</div>'
+    )
+
+
+def _build_pptx_preview_html(pairs):
+    if not pairs:
+        return ""
+    rows = []
+    for idx, (page_no, src, dst) in enumerate(pairs):
+        rows.append(f'''
+        <div style="background:#fff;border-radius:8px;padding:16px 18px;margin-bottom:12px;
+                    box-shadow:0 2px 10px rgba(0,0,0,.15)">
+          <div style="font-size:11px;color:#b09b63;font-weight:600;
+                      letter-spacing:.5px;margin-bottom:6px">第 {page_no} 张 · 原文</div>
+          <div style="font-size:14px;color:#555;line-height:1.75;margin-bottom:14px">{escape(src)}</div>
+          <div style="font-size:11px;color:#b09b63;font-weight:600;
+                      letter-spacing:.5px;margin-bottom:6px">第 {page_no} 张 · 译文</div>
+          <div style="font-size:14.5px;color:#111;line-height:1.9">{escape(dst)}</div>
+        </div>''')
+    return (
+        '<div style="background:#f5f1e6;border-radius:10px;padding:14px;'
+        'max-height:820px;overflow-y:auto;scroll-behavior:smooth">'
+        '<div style="color:#888;font-size:12px;text-align:center;'
+        'padding:6px 0 12px 0;letter-spacing:.5px">'
+        f'文本对照预览（前 {len(pairs)} 段）'
+        '</div>'
+        + "".join(rows) +
+        '<div style="color:#aaa;font-size:11px;text-align:center;padding:6px 0">'
+        '— 完整结果请下载 PPT 查看 —</div>'
+        '</div>'
+    )
 
 
 def make_progress_html(done, total, label=""):
@@ -576,7 +634,6 @@ def apply_translations(page, blocks, translations):
 
 
 def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
-    """生成前 n 页预览图，输出为清晰 JPEG（用于内嵌 HTML）"""
     clear_dir_preview(paths["preview_dir"])
     os.makedirs(paths["preview_dir"], exist_ok=True)
 
@@ -610,7 +667,6 @@ def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
             canvas = Image.new("RGB", (o.width + gap + t.width, hh), (40, 40, 40))
             canvas.paste(o, (0, 0))
             canvas.paste(t, (o.width + gap, 0))
-            # 缩到 PREVIEW_MAX_WIDTH 宽
             if canvas.width > PREVIEW_MAX_WIDTH:
                 ratio = PREVIEW_MAX_WIDTH / canvas.width
                 canvas = canvas.resize(
@@ -860,10 +916,31 @@ def docx_worker(task, paths, real_key, model):
 
     try:
         wdoc = Document(task.src_path)
+    except Exception as e:
+        import traceback
+        err_detail = traceback.format_exc()
+        task.status = "error"
+        task.error = f"打开 Word 失败：{e}"
+        task.log_msg(f"❌ 打开 Word 失败：{e}")
+        task.log_msg(f"   错误类型：{type(e).__name__}")
+        try:
+            task.log_msg(f"   文件路径：{task.src_path}")
+            task.log_msg(f"   文件大小：{os.path.getsize(task.src_path)} 字节")
+        except Exception:
+            pass
+        if "Package not found" in err_detail or "not a zip" in err_detail.lower():
+            task.log_msg("   ⚠️ 这通常意味着 .docx 其实是从 .doc 改后缀来的，")
+            task.log_msg("      请用 Word/WPS 打开后『另存为 → Word 文档(*.docx)』再上传。")
+        elif "PermissionError" in err_detail or "拒绝访问" in err_detail:
+            task.log_msg("   ⚠️ 文件被其他程序占用，请关闭 Word/WPS 后重试。")
+        save_state(task)
+        return
+
+    try:
         doc_bi = Document(task.src_path)
     except Exception as e:
         task.status = "error"
-        task.error = f"打开 Word 失败：{e}"
+        task.error = f"打开 Word（双语副本）失败：{e}"
         task.log_msg(task.error)
         save_state(task)
         return
@@ -901,15 +978,24 @@ def docx_worker(task, paths, real_key, model):
 
     done = 0
     error_msg = None
+    preview_pairs = []
+
     for para in para_targets:
         if task.stop_event.is_set():
             task.log_msg("⏸ 检测到停止信号，结束中文版段落翻译")
             break
+        src_text = para.text
         try:
-            tr = translate_text_cached(para.text)
+            tr = translate_text_cached(src_text)
         except RuntimeError as e:
             error_msg = str(e)
             break
+
+        if len(preview_pairs) < PREVIEW_PARAS:
+            preview_pairs.append((src_text, tr))
+            task.preview_html = _build_docx_preview_html(preview_pairs)
+            save_state(task)
+
         _docx_replace_para_text(para, tr)
         done += 1
         task.current = done
@@ -993,9 +1079,22 @@ def pptx_worker(task, paths, real_key, model):
     try:
         prs = Presentation(task.src_path)
     except Exception as e:
+        import traceback
+        err_detail = traceback.format_exc()
         task.status = "error"
         task.error = f"打开 PPT 失败：{e}"
-        task.log_msg(task.error)
+        task.log_msg(f"❌ 打开 PPT 失败：{e}")
+        task.log_msg(f"   错误类型：{type(e).__name__}")
+        try:
+            task.log_msg(f"   文件路径：{task.src_path}")
+            task.log_msg(f"   文件大小：{os.path.getsize(task.src_path)} 字节")
+        except Exception:
+            pass
+        if "Package not found" in err_detail or "not a zip" in err_detail.lower():
+            task.log_msg("   ⚠️ 这通常意味着 .pptx 其实是从 .ppt 改后缀来的，")
+            task.log_msg("      请用 PowerPoint/WPS 打开后『另存为 → PowerPoint 演示文稿(*.pptx)』再上传。")
+        elif "PermissionError" in err_detail or "拒绝访问" in err_detail:
+            task.log_msg("   ⚠️ 文件被其他程序占用，请关闭 PowerPoint/WPS 后重试。")
         save_state(task)
         return
 
@@ -1019,6 +1118,8 @@ def pptx_worker(task, paths, real_key, model):
 
     done = 0
     error_msg = None
+    preview_pairs = []
+
     for si, para in targets:
         if task.stop_event.is_set():
             task.log_msg("⏸ 检测到停止信号，结束")
@@ -1032,6 +1133,12 @@ def pptx_worker(task, paths, real_key, model):
         except RuntimeError as e:
             error_msg = str(e)
             break
+
+        if len(preview_pairs) < PREVIEW_PARAS:
+            preview_pairs.append((si + 1, text, tr))
+            task.preview_html = _build_pptx_preview_html(preview_pairs)
+            save_state(task)
+
         if para.runs:
             para.runs[0].text = tr
             for r in para.runs[1:]:
@@ -1107,6 +1214,7 @@ def start_task(kind, upload_path, real_key, model, trial):
 
 
 def on_start(api_key, model, doc_file, mode, trial):
+    """自动按文件后缀判断类型，忽略页面上的选择"""
     global SELECTED_TASK_ID
 
     real_key = (api_key or "").strip() or DEFAULT_API_KEY
@@ -1117,13 +1225,50 @@ def on_start(api_key, model, doc_file, mode, trial):
     if model not in ("deepseek-chat", "deepseek-reasoner"):
         model = "deepseek-chat"
 
-    is_pdf = mode.startswith("📕")
-    is_docx = mode.startswith("📘")
-    is_pptx = mode.startswith("📊")
+    # 根据后缀自动判断类型
+    name_lower = (doc_file.name or "").lower()
 
-    if (is_docx or is_pptx) and not HAS_OFFICE:
+    if name_lower.endswith(".pdf"):
+        kind = "pdf"
+    elif name_lower.endswith(".docx"):
+        kind = "docx"
+    elif name_lower.endswith(".pptx"):
+        kind = "pptx"
+    elif name_lower.endswith(".doc"):
+        cur = MANAGER.get(SELECTED_TASK_ID) if SELECTED_TASK_ID else None
+        if cur:
+            cur.log_msg("❌ 不支持老版 .doc 格式")
+            cur.log_msg("   请用 Word/WPS 打开后『另存为 → Word 文档 (*.docx)』再上传。")
+            save_state(cur)
         return on_refresh_fast() + ([], None)
-    if is_pdf and not os.path.exists(FONT_PATH):
+    elif name_lower.endswith(".ppt"):
+        cur = MANAGER.get(SELECTED_TASK_ID) if SELECTED_TASK_ID else None
+        if cur:
+            cur.log_msg("❌ 不支持老版 .ppt 格式")
+            cur.log_msg("   请用 PowerPoint/WPS 打开后『另存为 → PowerPoint 演示文稿 (*.pptx)』再上传。")
+            save_state(cur)
+        return on_refresh_fast() + ([], None)
+    else:
+        cur = MANAGER.get(SELECTED_TASK_ID) if SELECTED_TASK_ID else None
+        if cur:
+            cur.log_msg(f"❌ 不支持的文件类型：{doc_file.name}")
+            cur.log_msg("   只支持 .pdf / .docx / .pptx")
+            save_state(cur)
+        return on_refresh_fast() + ([], None)
+
+    if kind in ("docx", "pptx") and not HAS_OFFICE:
+        cur = MANAGER.get(SELECTED_TASK_ID) if SELECTED_TASK_ID else None
+        if cur:
+            cur.log_msg("❌ 未安装 python-docx / python-pptx，无法处理 Word / PPT")
+            cur.log_msg("   请运行：pip install python-docx python-pptx")
+            save_state(cur)
+        return on_refresh_fast() + ([], None)
+
+    if kind == "pdf" and not os.path.exists(FONT_PATH):
+        cur = MANAGER.get(SELECTED_TASK_ID) if SELECTED_TASK_ID else None
+        if cur:
+            cur.log_msg(f"❌ 字体文件不存在：{FONT_PATH}")
+            save_state(cur)
         return on_refresh_fast() + ([], None)
 
     src_name = os.path.basename(doc_file.name)
@@ -1138,7 +1283,6 @@ def on_start(api_key, model, doc_file, mode, trial):
         save_state(existing)
         return on_refresh_fast() + ([], None)
 
-    kind = "pdf" if is_pdf else ("docx" if is_docx else "pptx")
     try:
         start_task(kind, doc_file.name, real_key, model, trial)
     except Exception:
@@ -1203,8 +1347,9 @@ def on_load_preview():
         return build_preview_html([]), []
 
     imgs = current.preview_images if current.preview_images else []
+    ph = getattr(current, "preview_html", "") or ""
     files = [os.path.abspath(f) for f in current.output_files if f and os.path.exists(f)]
-    return build_preview_html(imgs), files
+    return build_preview_html(imgs, ph), files
 
 
 def build_task_list_html(tasks):
@@ -1246,7 +1391,6 @@ def build_task_list_html(tasks):
 
 
 def on_refresh_fast():
-    """返回 5 个值：task_list, progress, log, stop_dd, gallery_html"""
     tasks = MANAGER.all_sorted()
     task_list_html = build_task_list_html(tasks)
 
@@ -1258,17 +1402,22 @@ def on_refresh_fast():
         progress_html = make_progress_html(0, 1, "等待开始")
         log_text = ""
         previews = []
+        preview_html = ""
     else:
         progress_html = make_progress_html(current.current, current.total, current.label)
         log_text = "\n".join(current.log[-40:])
         previews = current.preview_images or []
+        preview_html = getattr(current, "preview_html", "") or ""
 
-    # 用文件 mtime 判断预览是否变化，只有变化才重建 HTML
     if current is not None:
-        sig = preview_signature(previews)
+        if preview_html:
+            sig = ("html", len(preview_html), preview_html[:30], preview_html[-30:])
+        else:
+            sig = preview_signature(previews)
+
         if _LAST_PREVIEW_SIG.get(current.task_id) != sig:
             _LAST_PREVIEW_SIG[current.task_id] = sig
-            html = build_preview_html(previews)
+            html = build_preview_html(previews, preview_html)
             _PREVIEW_HTML_CACHE[current.task_id] = html
             gallery_value = html
         else:
@@ -1455,9 +1604,9 @@ with gr.Blocks(
     #stop_one_btn:hover { background: #6b2222 !important; }
 
     #preview_box::-webkit-scrollbar { width: 10px; }
-    #preview_box::-webkit-scrollbar-track { background: #1f1f1f; border-radius: 5px; }
-    #preview_box::-webkit-scrollbar-thumb { background: #555; border-radius: 5px; }
-    #preview_box::-webkit-scrollbar-thumb:hover { background: #777; }
+    #preview_box::-webkit-scrollbar-track { background: #e8e1cc; border-radius: 5px; }
+    #preview_box::-webkit-scrollbar-thumb { background: #b09b63; border-radius: 5px; }
+    #preview_box::-webkit-scrollbar-thumb:hover { background: #8a7a4f; }
 
     .gradio-container .accordion-header {
         background: #f5f1e6 !important; color: #222 !important; font-size: 14.5px !important;
@@ -1479,12 +1628,14 @@ with gr.Blocks(
         <br>
         <span class="k">📁 成果</span>归于 <code>result/&lt;文件名&gt;/</code>
         <br>
-        <span class="k">🔄 多任务</span>上传文件 → 点「创建新任务」→ 上传框自动清空，可以继续传下一个（不同书）。<br>
-        　　　　　 <b>同一本书只允许一个任务运行</b>，重复点会被拒绝。
+        <span class="k">📄 上传</span>拖入文件即自动识别类型（.pdf / .docx / .pptx），无需手动选。<br>
+        　　　　　 下方"文档类型"选项只作参考，不影响实际处理。
+        <br>
+        <span class="k">🔄 多任务</span>上传文件 → 点「创建新任务」→ 上传框自动清空，可以继续传下一个。
         <br>
         <span class="k">⏸ 停止</span>下方可<b>单独停止</b>某个任务，也可<b>一键停止全部</b>。
         <br>
-        <span class="k">👀 预览</span>前 5 页左右对照，<b>PDF 式上下滚动阅读</b>，任务启动后立刻出现。
+        <span class="k">👀 预览</span>PDF 显示前 5 页左右对照；Word / PPT 显示前 5 段文本对照。
       </div>
     </div>
     """)
@@ -1507,12 +1658,12 @@ with gr.Blocks(
     file_mode = gr.Radio(
         choices=["📕 PDF 书籍", "📘 Word 文档", "📊 PPT 演示"],
         value="📕 PDF 书籍",
-        label="📂 文档类型（先选类型，再上传文件）",
+        label="📂 文档类型（仅参考，实际按文件后缀自动判断）",
         elem_id="file_mode",
     )
 
     doc_file = gr.File(
-        label="📄 上传文档以创建新任务（支持 .pdf / .docx / .pptx，刷新后不保留）",
+        label="📄 上传文档以创建新任务（自动识别 .pdf / .docx / .pptx）",
         file_types=[".pdf", ".docx", ".pptx"],
         elem_id="pdf_upload",
     )
@@ -1550,7 +1701,7 @@ with gr.Blocks(
     with gr.Accordion("📋 当前任务日志（点击展开 / 收起）", open=False):
         log = gr.Textbox(label="", lines=14, interactive=False, show_label=False)
 
-    gr.Markdown("### 👀 效果预览（前 5 页左右对照 · PDF 式上下滚动）")
+    gr.Markdown("### 👀 效果预览（PDF 图片对照 · Word/PPT 文本对照）")
     gallery = gr.HTML(
         value=build_preview_html([]),
         elem_id="preview_box",
@@ -1623,35 +1774,29 @@ with gr.Blocks(
 
 if __name__ == "__main__":
     PORT = 7860
-    URL = f"http://127.0.0.1:{PORT}"
+    URL = "http://127.0.0.1:" + str(PORT)
 
-    # 把网址写到本地文件，随时能打开看
     try:
         with open("访问网址.txt", "w", encoding="utf-8") as f:
-            f.write(f"""PDF / Word / PPT 翻译器
-
-浏览器访问网址：
-{URL}
-
-（这个文件由程序自动生成，改动此文件无效）
-（如果打不开，说明程序已停止，请双击 “重启翻译器.bat”）
-""")
+            f.write("PDF / Word / PPT 翻译器\n\n")
+            f.write("浏览器访问网址：\n")
+            f.write(URL + "\n\n")
+            f.write("（这个文件由程序自动生成，改动此文件无效）\n")
+            f.write("（如果打不开，说明程序已停止，请双击 重启翻译器.bat）\n")
     except Exception:
         pass
 
     print()
-    print("╔" + "═" * 62 + "╗")
-    print("║" + " " * 62 + "║")
-    print("║" + "  📖 PDF / Word / PPT 翻译器 已启动".ljust(54) + "║")
-    print("║" + " " * 62 + "║")
-    print("║" + "  🌐 在浏览器输入以下网址进入：".ljust(54) + "║")
-    print("║" + " " * 62 + "║")
-    print("║" + f"      {URL}".ljust(62) + "║")
-    print("║" + " " * 62 + "║")
-    print("║" + "  ⚠️  别关这个终端窗口，否则程序停止".ljust(54) + "║")
-    print("║" + "  💡 网址也保存在 “访问网址.txt” 中，随时可查".ljust(52) + "║")
-    print("║" + " " * 62 + "║")
-    print("╚" + "═" * 62 + "╝")
+    print("=" * 64)
+    print("  PDF / Word / PPT 翻译器 已启动")
+    print()
+    print("  在浏览器输入以下网址进入：")
+    print()
+    print("      " + URL)
+    print()
+    print("  别关这个终端窗口，否则程序停止")
+    print("  网址也保存在 访问网址.txt 中，随时可查")
+    print("=" * 64)
     print()
 
     print(f"   结果目录：{os.path.abspath(RESULT_ROOT)}")
