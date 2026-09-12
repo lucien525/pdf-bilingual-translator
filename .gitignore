@@ -4,6 +4,11 @@
 # 翻译结果
 result/
 
+# 临时文件
+访问网址.txt
+font_test.pdf
+test.py
+
 # Python
 __pycache__/
 *.py[cod]

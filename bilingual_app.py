@@ -8,15 +8,17 @@ import sys
 import json
 import time
 import re
+import glob
+import base64
 import hashlib
 import shutil
 import threading
 import uuid
+import io
 from dataclasses import dataclass, field
 from typing import Optional
 
 import pymupdf as fitz
-# 关闭 PDF 内部损坏对象产生的警告刷屏（如 "cannot find object in xref"）
 try:
     fitz.TOOLS.mupdf_display_errors(False)
 except Exception:
@@ -48,9 +50,13 @@ if DEFAULT_MODEL not in ("deepseek-chat", "deepseek-reasoner"):
 FONT_PATH = r"D:\file\translate\word_type\09_SourceHanSerifSC\OTF\SimplifiedChinese\SourceHanSerifSC-Regular.otf"
 RESULT_ROOT = "result"
 RENDER_ZOOM = 2.0
+PREVIEW_PAGES = 5
+PREVIEW_MAX_WIDTH = 1400         # 预览图最大宽度（越大越清晰，HTML 也越大）
+PREVIEW_JPEG_QUALITY = 88        # 预览图 JPEG 质量（1-95）
 
-# 全局 IO 锁：防止多线程同时写同一个 JSON 文件导致损坏
 _IO_LOCK = threading.Lock()
+_LAST_PREVIEW_SIG = {}
+_PREVIEW_HTML_CACHE = {}
 
 SYSTEM_PROMPT = (
     "你是一位资深文学翻译家，精通中英双语，译笔力求神似而非字对字。"
@@ -203,6 +209,35 @@ def scan_all_states():
                 pass
 
 
+def cleanup_orphan_files():
+    """清理因保存失败兜底生成的 translated_new_<时间戳>.pdf"""
+    root = os.path.abspath(RESULT_ROOT)
+    if not os.path.isdir(root):
+        return 0
+    removed = 0
+    for name in os.listdir(root):
+        d = os.path.join(root, name)
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            if f.startswith("translated_new_") and f.endswith(".pdf"):
+                try:
+                    os.remove(os.path.join(d, f))
+                    removed += 1
+                    print(f"   🧹 清理冗余文件：{name}/{f}")
+                except Exception:
+                    pass
+            # 清理未完成的临时 PDF
+            if f.endswith(".tmp.pdf"):
+                try:
+                    os.remove(os.path.join(d, f))
+                    removed += 1
+                    print(f"   🧹 清理临时文件：{name}/{f}")
+                except Exception:
+                    pass
+    return removed
+
+
 # ============================================================
 # 路径 / 工具
 # ============================================================
@@ -267,6 +302,129 @@ def load_progress_file(path):
 
 def save_progress_file(path, done_pages):
     save_json_file(path, {"done_pages": sorted(int(x) for x in done_pages)})
+
+
+def clear_dir_preview(folder):
+    for pat in ("*.png", "*.jpg", "*.jpeg"):
+        try:
+            for f in glob.glob(os.path.join(folder, pat)):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+def safe_save_pdf(doc, out_path, retries=5):
+    """保存 PDF：先写临时文件，再原子替换。目标文件被占用时自动重试。"""
+    tmp_path = out_path + ".tmp.pdf"
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except Exception:
+        pass
+
+    doc.save(tmp_path, deflate=True)
+
+    last_err = None
+    for attempt in range(retries):
+        try:
+            os.replace(tmp_path, out_path)
+            return out_path
+        except PermissionError as e:
+            last_err = e
+            time.sleep(0.8 * (attempt + 1))
+        except OSError as e:
+            last_err = e
+            time.sleep(0.8 * (attempt + 1))
+
+    fallback = out_path[:-4] + f"_new_{int(time.time())}.pdf"
+    try:
+        os.replace(tmp_path, fallback)
+        return fallback
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise last_err if last_err else RuntimeError("无法保存 PDF")
+
+
+def img_to_base64_dataurl(path):
+    """把本地图片转成 base64 data URL（内嵌 HTML，避免 /file= 404）"""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        b64 = base64.b64encode(data).decode("ascii")
+        low = path.lower()
+        if low.endswith(".jpg") or low.endswith(".jpeg"):
+            mime = "image/jpeg"
+        elif low.endswith(".png"):
+            mime = "image/png"
+        else:
+            mime = "image/jpeg"
+        return f"data:{mime};base64,{b64}"
+    except Exception:
+        return None
+
+
+def preview_signature(preview_imgs):
+    """用文件名 + 修改时间作为签名，判断是否需要重建 HTML"""
+    parts = []
+    for p in preview_imgs or []:
+        try:
+            parts.append(f"{os.path.basename(p)}:{os.path.getmtime(p):.0f}")
+        except Exception:
+            parts.append(os.path.basename(p) if p else "")
+    return tuple(parts)
+
+
+def build_preview_html(preview_imgs):
+    """构建 PDF 式纵向滚动的预览 HTML（base64 内嵌图片）"""
+    if not preview_imgs:
+        return '''
+        <div style="padding:30px 20px;color:#888;text-align:center;font-size:13.5px;
+                    background:#faf8f2;border:1px dashed #ddd5c0;border-radius:10px;
+                    line-height:1.8">
+            📄 暂无预览<br>
+            <span style="font-size:12px;color:#aaa">翻译启动后会显示前 5 页的左右对照</span>
+        </div>
+        '''
+
+    imgs_html = []
+    for p in preview_imgs:
+        data_url = img_to_base64_dataurl(p)
+        if not data_url:
+            continue
+        imgs_html.append(
+            f'<img src="{data_url}" '
+            f'style="width:100%;display:block;margin:0 0 14px 0;'
+            f'box-shadow:0 2px 10px rgba(0,0,0,.18);border-radius:4px;">'
+        )
+
+    if not imgs_html:
+        return '''
+        <div style="padding:30px 20px;color:#888;text-align:center;font-size:13.5px;
+                    background:#faf8f2;border:1px dashed #ddd5c0;border-radius:10px">
+            ⚠️ 预览图片加载失败
+        </div>
+        '''
+
+    return f'''
+    <div style="background:#2b2b2b;border-radius:10px;padding:14px;
+                max-height:820px;overflow-y:auto;
+                scroll-behavior:smooth">
+      <div style="color:#aaa;font-size:12px;text-align:center;
+                  padding:6px 0 12px 0;letter-spacing:.5px">
+        左右对照 · 上下滚动阅读（{len(imgs_html)} 页）
+      </div>
+      {''.join(imgs_html)}
+      <div style="color:#666;font-size:11px;text-align:center;padding:6px 0">
+        — 仅显示前 {len(imgs_html)} 页 —
+      </div>
+    </div>
+    '''
 
 
 def make_progress_html(done, total, label=""):
@@ -417,59 +575,99 @@ def apply_translations(page, blocks, translations):
             )
 
 
-def render_page_pngs(src_path, trans_path, num_pages, img_dir):
-    os.makedirs(img_dir, exist_ok=True)
-    orig = fitz.open(src_path)
-    trans = fitz.open(trans_path)
-    n = min(num_pages, len(orig), len(trans))
-    orig_paths, trans_paths = [], []
+def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
+    """生成前 n 页预览图，输出为清晰 JPEG（用于内嵌 HTML）"""
+    clear_dir_preview(paths["preview_dir"])
+    os.makedirs(paths["preview_dir"], exist_ok=True)
+
+    if not os.path.exists(trans_path):
+        return []
+
+    try:
+        with open(trans_path, "rb") as f:
+            data = f.read()
+        trans = fitz.open(stream=data, filetype="pdf")
+    except Exception:
+        return []
+
+    orig = fitz.open(task.src_path)
+    n = min(n_preview, len(orig), len(trans))
+    preview_imgs = []
     for i in range(n):
-        o_path = os.path.join(img_dir, f"orig_{i:04d}.png")
-        t_path = os.path.join(img_dir, f"trans_{i:04d}.png")
-        orig[i].get_pixmap(matrix=fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM)).save(o_path)
-        trans[i].get_pixmap(matrix=fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM)).save(t_path)
-        orig_paths.append(o_path)
-        trans_paths.append(t_path)
+        if task.stop_event.is_set():
+            break
+        try:
+            o_pix = orig[i].get_pixmap(matrix=fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM))
+            t_pix = trans[i].get_pixmap(matrix=fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM))
+            o = Image.open(io.BytesIO(o_pix.tobytes("png"))).convert("RGB")
+            t = Image.open(io.BytesIO(t_pix.tobytes("png"))).convert("RGB")
+            hh = max(o.height, t.height)
+            if o.height != hh:
+                o = o.resize((int(o.width * hh / o.height), hh), Image.LANCZOS)
+            if t.height != hh:
+                t = t.resize((int(t.width * hh / t.height), hh), Image.LANCZOS)
+            gap = 8
+            canvas = Image.new("RGB", (o.width + gap + t.width, hh), (40, 40, 40))
+            canvas.paste(o, (0, 0))
+            canvas.paste(t, (o.width + gap, 0))
+            # 缩到 PREVIEW_MAX_WIDTH 宽
+            if canvas.width > PREVIEW_MAX_WIDTH:
+                ratio = PREVIEW_MAX_WIDTH / canvas.width
+                canvas = canvas.resize(
+                    (PREVIEW_MAX_WIDTH, int(canvas.height * ratio)),
+                    Image.LANCZOS,
+                )
+            p = os.path.join(paths["preview_dir"], f"compare_{i:04d}.jpg")
+            canvas.save(p, "JPEG", quality=PREVIEW_JPEG_QUALITY, optimize=True)
+            preview_imgs.append(p)
+        except Exception:
+            continue
     orig.close()
     trans.close()
-    return orig_paths, trans_paths
+    return preview_imgs
 
 
-def make_side_by_side(orig_png, trans_png, out_png):
-    o = Image.open(orig_png).convert("RGB")
-    t = Image.open(trans_png).convert("RGB")
-    hh = max(o.height, t.height)
-    if o.height != hh:
-        o = o.resize((int(o.width * hh / o.height), hh), Image.LANCZOS)
-    if t.height != hh:
-        t = t.resize((int(t.width * hh / t.height), hh), Image.LANCZOS)
-    gap = 8
-    canvas = Image.new("RGB", (o.width + gap + t.width, hh), (40, 40, 40))
-    canvas.paste(o, (0, 0))
-    canvas.paste(t, (o.width + gap, 0))
-    canvas.thumbnail((1800, 1400), Image.LANCZOS)
-    canvas.save(out_png)
-    return out_png
+def make_bilingual_pdf_preview(trans_path, paths, task, n_preview=PREVIEW_PAGES):
+    if not os.path.exists(trans_path):
+        return
+    try:
+        with open(trans_path, "rb") as f:
+            data = f.read()
+        trans = fitz.open(stream=data, filetype="pdf")
+    except Exception:
+        return
 
-
-def make_bilingual_pdf(orig_paths, trans_paths, out_pdf):
-    pages = []
-    for o_path, t_path in zip(orig_paths, trans_paths):
-        o = Image.open(o_path).convert("RGB")
-        t = Image.open(t_path).convert("RGB")
-        hh = max(o.height, t.height)
-        if o.height != hh:
-            o = o.resize((int(o.width * hh / o.height), hh), Image.LANCZOS)
-        if t.height != hh:
-            t = t.resize((int(t.width * hh / t.height), hh), Image.LANCZOS)
-        gap = 10
-        canvas = Image.new("RGB", (o.width + gap + t.width, hh), (255, 255, 255))
-        canvas.paste(o, (0, 0))
-        canvas.paste(t, (o.width + gap, 0))
-        pages.append(canvas)
-    if pages:
-        pages[0].save(out_pdf, save_all=True, append_images=pages[1:], resolution=120.0)
-    return out_pdf
+    try:
+        orig = fitz.open(task.src_path)
+        n = min(n_preview, len(orig), len(trans))
+        pages = []
+        for i in range(n):
+            if task.stop_event.is_set():
+                break
+            try:
+                o_pix = orig[i].get_pixmap(matrix=fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM))
+                t_pix = trans[i].get_pixmap(matrix=fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM))
+                o = Image.open(io.BytesIO(o_pix.tobytes("png"))).convert("RGB")
+                t = Image.open(io.BytesIO(t_pix.tobytes("png"))).convert("RGB")
+                hh = max(o.height, t.height)
+                if o.height != hh:
+                    o = o.resize((int(o.width * hh / o.height), hh), Image.LANCZOS)
+                if t.height != hh:
+                    t = t.resize((int(t.width * hh / t.height), hh), Image.LANCZOS)
+                gap = 10
+                canvas = Image.new("RGB", (o.width + gap + t.width, hh), (255, 255, 255))
+                canvas.paste(o, (0, 0))
+                canvas.paste(t, (o.width + gap, 0))
+                pages.append(canvas)
+            except Exception:
+                continue
+        orig.close()
+        trans.close()
+        if pages:
+            pages[0].save(paths["bilingual_pdf"], save_all=True,
+                          append_images=pages[1:], resolution=150.0)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -516,7 +714,25 @@ def pdf_worker(task, paths, real_key, model, trial):
     cache = load_json_file(paths["cache_file"], {})
     done_pages = load_progress_file(paths["progress_file"])
 
-    doc = fitz.open(task.src_path)
+    pdf_exists = os.path.exists(paths["output_pdf"])
+    if done_pages and pdf_exists:
+        try:
+            with open(paths["output_pdf"], "rb") as f:
+                data = f.read()
+            doc = fitz.open(stream=data, filetype="pdf")
+            task.log_msg(f"📂 从已翻译 PDF 续传（已翻 {len(done_pages)} 页，本次不重做）")
+        except Exception as e:
+            task.log_msg(f"⚠️ 打开旧译文失败，从头开始：{e}")
+            doc = fitz.open(task.src_path)
+            done_pages = set()
+            save_progress_file(paths["progress_file"], done_pages)
+    else:
+        doc = fitz.open(task.src_path)
+        if done_pages and not pdf_exists:
+            task.log_msg("⚠️ 检测到进度记录但缺少译文 PDF，从头开始")
+            done_pages = set()
+            save_progress_file(paths["progress_file"], done_pages)
+
     total = len(doc)
     limit = min(5, total) if trial else total
 
@@ -525,9 +741,19 @@ def pdf_worker(task, paths, real_key, model, trial):
     task.label = f"PDF · 目标前 {limit} 页"
     task.current = len([p for p in done_pages if p <= limit])
     task.log_msg(f"✅ PDF 共 {total} 页，本次目标前 {limit} 页")
-    if task.current > 0:
-        task.log_msg(f"📚 已处理 {task.current} 页，从第 {max(done_pages)+1} 页继续（跳过缓存）")
     save_state(task)
+
+    if pdf_exists:
+        try:
+            task.log_msg("🖼 生成前 5 页预览……")
+            task.preview_images = render_preview_only(paths["output_pdf"], paths, task)
+            make_bilingual_pdf_preview(paths["output_pdf"], paths, task)
+            task.output_files = [paths["output_pdf"], paths["bilingual_pdf"]]
+            save_state(task)
+            task.log_msg(f"✅ 预览图就绪（{len(task.preview_images)} 张）")
+            save_state(task)
+        except Exception as e:
+            task.log_msg(f"⚠️ 初始预览生成失败：{e}")
 
     newly = []
     completed = False
@@ -541,17 +767,11 @@ def pdf_worker(task, paths, real_key, model, trial):
         if page_num > limit and page_num not in done_pages:
             break
 
+        if page_num in done_pages:
+            continue
+
         page = doc[pno]
         blocks = [b for b in page.get_text("blocks") if b[6] == 0 and b[4].strip()]
-
-        if page_num in done_pages:
-            if blocks:
-                try:
-                    trans = translate_page(client, model, blocks, cache, paths["cache_file"])
-                    apply_translations(page, blocks, trans)
-                except Exception:
-                    pass
-            continue
 
         if not blocks:
             done_pages.add(page_num)
@@ -578,13 +798,28 @@ def pdf_worker(task, paths, real_key, model, trial):
         task.label = f"已翻 {task.current}/{limit} 页"
         task.log_msg(f"✅ 第 {page_num} 页完成（本次新增 {len(newly)} 页）")
         save_state(task)
+
+        if page_num <= PREVIEW_PAGES:
+            try:
+                safe_save_pdf(doc, paths["output_pdf"])
+                task.preview_images = render_preview_only(paths["output_pdf"], paths, task)
+                make_bilingual_pdf_preview(paths["output_pdf"], paths, task)
+                task.output_files = [paths["output_pdf"], paths["bilingual_pdf"]]
+                save_state(task)
+            except Exception:
+                pass
     else:
         completed = True
 
     try:
-        doc.save(paths["output_pdf"], deflate=True)
+        safe_save_pdf(doc, paths["output_pdf"])
+    except Exception as e:
+        error_msg = error_msg or f"保存译文 PDF 失败：{e}"
     finally:
-        doc.close()
+        try:
+            doc.close()
+        except Exception:
+            pass
 
     if not done_pages:
         task.status = "error"
@@ -593,25 +828,12 @@ def pdf_worker(task, paths, real_key, model, trial):
         save_state(task)
         return
 
-    render_up_to = max(done_pages)
-    task.label = f"渲染前 {render_up_to} 页"
-    save_state(task)
-
-    orig_paths, trans_paths = render_page_pngs(task.src_path, paths["output_pdf"], render_up_to, paths["img_dir"])
-    make_bilingual_pdf(orig_paths, trans_paths, paths["bilingual_pdf"])
-
-    os.makedirs(paths["preview_dir"], exist_ok=True)
-    preview_imgs = []
-    for i in range(min(6, len(orig_paths))):
-        try:
-            p = os.path.join(paths["preview_dir"], f"compare_{i:04d}.png")
-            make_side_by_side(orig_paths[i], trans_paths[i], p)
-            preview_imgs.append(p)
-        except Exception:
-            pass
-
-    task.preview_images = preview_imgs
-    task.output_files = [paths["output_pdf"], paths["bilingual_pdf"]]
+    try:
+        task.preview_images = render_preview_only(paths["output_pdf"], paths, task)
+        make_bilingual_pdf_preview(paths["output_pdf"], paths, task)
+        task.output_files = [paths["output_pdf"], paths["bilingual_pdf"]]
+    except Exception:
+        pass
 
     if completed:
         task.status = "done"
@@ -619,8 +841,8 @@ def pdf_worker(task, paths, real_key, model, trial):
         task.log_msg(f"🎉 全部完成！共 {len(done_pages)} 页")
     elif task.stop_event.is_set():
         task.status = "paused"
-        task.label = f"已暂停（半成品），续自第 {render_up_to + 1} 页"
-        task.log_msg(f"🛑 已暂停。下次从第 {render_up_to + 1} 页继续，不重复扣费")
+        task.label = f"已暂停（半成品），共翻 {len(done_pages)} 页"
+        task.log_msg(f"🛑 已暂停。下次点开始会从第 {max(done_pages) + 1} 页继续，不重复扣费")
     elif error_msg:
         task.status = "error"
         task.error = error_msg
@@ -889,8 +1111,7 @@ def on_start(api_key, model, doc_file, mode, trial):
 
     real_key = (api_key or "").strip() or DEFAULT_API_KEY
     if not real_key or not doc_file:
-        t, p, l, dd = on_refresh_fast()
-        return t, p, l, [], [], doc_file, dd
+        return on_refresh_fast() + ([], None)
 
     model = (model or DEFAULT_MODEL).strip()
     if model not in ("deepseek-chat", "deepseek-reasoner"):
@@ -901,11 +1122,9 @@ def on_start(api_key, model, doc_file, mode, trial):
     is_pptx = mode.startswith("📊")
 
     if (is_docx or is_pptx) and not HAS_OFFICE:
-        t, p, l, dd = on_refresh_fast()
-        return t, p, l, [], [], doc_file, dd
+        return on_refresh_fast() + ([], None)
     if is_pdf and not os.path.exists(FONT_PATH):
-        t, p, l, dd = on_refresh_fast()
-        return t, p, l, [], [], doc_file, dd
+        return on_refresh_fast() + ([], None)
 
     src_name = os.path.basename(doc_file.name)
     base = os.path.splitext(src_name)[0]
@@ -916,19 +1135,16 @@ def on_start(api_key, model, doc_file, mode, trial):
     if existing is not None:
         SELECTED_TASK_ID = existing.task_id
         existing.log_msg(f"⚠️ 收到重复创建请求，已拒绝。本任务已存在并正在运行（#{existing.task_id}）")
-        existing.log_msg("   如需重新开始，请先停掉它")
         save_state(existing)
-        t, p, l, dd = on_refresh_fast()
-        return t, p, l, [], [], None, dd
+        return on_refresh_fast() + ([], None)
 
     kind = "pdf" if is_pdf else ("docx" if is_docx else "pptx")
     try:
         start_task(kind, doc_file.name, real_key, model, trial)
-    except Exception as e:
-        print(f"启动任务失败：{e}")
+    except Exception:
+        pass
 
-    t, p, l, dd = on_refresh_fast()
-    return t, p, l, [], [], None, dd
+    return on_refresh_fast() + ([], None)
 
 
 def on_stop_all():
@@ -951,7 +1167,6 @@ def on_stop_all():
 
 
 def on_stop_selected(label):
-    """停止用户在下拉框里选中的那一个任务"""
     global SELECTED_TASK_ID
     if not label:
         return on_refresh_fast()
@@ -985,11 +1200,11 @@ def on_load_preview():
         tasks = MANAGER.all_sorted()
         current = tasks[0] if tasks else None
     if current is None:
-        return [], []
+        return build_preview_html([]), []
 
     imgs = current.preview_images if current.preview_images else []
     files = [os.path.abspath(f) for f in current.output_files if f and os.path.exists(f)]
-    return imgs, files
+    return build_preview_html(imgs), files
 
 
 def build_task_list_html(tasks):
@@ -1031,6 +1246,7 @@ def build_task_list_html(tasks):
 
 
 def on_refresh_fast():
+    """返回 5 个值：task_list, progress, log, stop_dd, gallery_html"""
     tasks = MANAGER.all_sorted()
     task_list_html = build_task_list_html(tasks)
 
@@ -1041,11 +1257,27 @@ def on_refresh_fast():
     if current is None:
         progress_html = make_progress_html(0, 1, "等待开始")
         log_text = ""
+        previews = []
     else:
         progress_html = make_progress_html(current.current, current.total, current.label)
         log_text = "\n".join(current.log[-40:])
+        previews = current.preview_images or []
 
-    # 只列活跃任务（queued / running / stopping）
+    # 用文件 mtime 判断预览是否变化，只有变化才重建 HTML
+    if current is not None:
+        sig = preview_signature(previews)
+        if _LAST_PREVIEW_SIG.get(current.task_id) != sig:
+            _LAST_PREVIEW_SIG[current.task_id] = sig
+            html = build_preview_html(previews)
+            _PREVIEW_HTML_CACHE[current.task_id] = html
+            gallery_value = html
+        else:
+            gallery_value = _PREVIEW_HTML_CACHE.get(
+                current.task_id, build_preview_html([])
+            )
+    else:
+        gallery_value = build_preview_html([])
+
     active = [t for t in tasks if t.status in ("queued", "running", "stopping")]
     choices = []
     for t in active:
@@ -1054,7 +1286,7 @@ def on_refresh_fast():
 
     dd_update = gr.update(choices=choices)
 
-    return task_list_html, progress_html, log_text, dd_update
+    return task_list_html, progress_html, log_text, dd_update, gallery_value
 
 
 def open_result_folder():
@@ -1212,7 +1444,6 @@ with gr.Blocks(
         background: #e8e1cc !important; border-color: #c9bfa3 !important;
     }
 
-    /* 单独停止任务的下拉 + 按钮 */
     #stop_one_row { gap: 12px !important; align-items: stretch !important; }
     #stop_dd { flex: 3 1 0 !important; min-width: 0 !important; }
     #stop_one_btn {
@@ -1222,6 +1453,11 @@ with gr.Blocks(
         border: none !important; font-size: 15px !important; font-weight: 600 !important;
     }
     #stop_one_btn:hover { background: #6b2222 !important; }
+
+    #preview_box::-webkit-scrollbar { width: 10px; }
+    #preview_box::-webkit-scrollbar-track { background: #1f1f1f; border-radius: 5px; }
+    #preview_box::-webkit-scrollbar-thumb { background: #555; border-radius: 5px; }
+    #preview_box::-webkit-scrollbar-thumb:hover { background: #777; }
 
     .gradio-container .accordion-header {
         background: #f5f1e6 !important; color: #222 !important; font-size: 14.5px !important;
@@ -1247,6 +1483,8 @@ with gr.Blocks(
         　　　　　 <b>同一本书只允许一个任务运行</b>，重复点会被拒绝。
         <br>
         <span class="k">⏸ 停止</span>下方可<b>单独停止</b>某个任务，也可<b>一键停止全部</b>。
+        <br>
+        <span class="k">👀 预览</span>前 5 页左右对照，<b>PDF 式上下滚动阅读</b>，任务启动后立刻出现。
       </div>
     </div>
     """)
@@ -1312,13 +1550,10 @@ with gr.Blocks(
     with gr.Accordion("📋 当前任务日志（点击展开 / 收起）", open=False):
         log = gr.Textbox(label="", lines=14, interactive=False, show_label=False)
 
-    gr.Markdown("### 👀 效果预览（PDF 任务显示左右对照，最多前 6 张）")
-    gallery = gr.Gallery(
-        label="对照预览",
-        columns=1,
-        height=600,
-        object_fit="contain",
-        show_label=False,
+    gr.Markdown("### 👀 效果预览（前 5 页左右对照 · PDF 式上下滚动）")
+    gallery = gr.HTML(
+        value=build_preview_html([]),
+        elem_id="preview_box",
     )
 
     gr.Markdown("### 💾 下载（可选）")
@@ -1331,8 +1566,8 @@ with gr.Blocks(
 
     load_btn = gr.Button("🔍 加载当前任务的预览图和下载文件", variant="secondary")
 
-    fast_outputs = [task_list_html, progress_bar, log, stop_dd]
-    full_outputs = [task_list_html, progress_bar, log, gallery, out_files, doc_file, stop_dd]
+    fast_outputs = [task_list_html, progress_bar, log, stop_dd, gallery]
+    full_outputs = [task_list_html, progress_bar, log, stop_dd, gallery, out_files, doc_file]
 
     btn.click(
         on_start,
@@ -1374,8 +1609,8 @@ with gr.Blocks(
             concurrency_limit=None,
             concurrency_id="tick",
         )
-    except Exception as e:
-        print(f"⚠️ 未能启用自动刷新（Timer 不可用）：{e}")
+    except Exception:
+        pass
 
     demo.load(
         on_refresh_fast,
@@ -1387,24 +1622,62 @@ with gr.Blocks(
 
 
 if __name__ == "__main__":
-    if DEFAULT_API_KEY:
-        print(f"✅ 已从 .env 读取默认 Key（{DEFAULT_API_KEY[:6]}...）")
-    else:
-        print("ℹ️  .env 中未找到 DEEPSEEK_API_KEY，需在网页里手动填写")
-    print(f"ℹ️  默认模型：{DEFAULT_MODEL}")
-    print(f"ℹ️  结果目录：{os.path.abspath(RESULT_ROOT)}")
+    PORT = 7860
+    URL = f"http://127.0.0.1:{PORT}"
 
+    # 把网址写到本地文件，随时能打开看
+    try:
+        with open("访问网址.txt", "w", encoding="utf-8") as f:
+            f.write(f"""PDF / Word / PPT 翻译器
+
+浏览器访问网址：
+{URL}
+
+（这个文件由程序自动生成，改动此文件无效）
+（如果打不开，说明程序已停止，请双击 “重启翻译器.bat”）
+""")
+    except Exception:
+        pass
+
+    print()
+    print("╔" + "═" * 62 + "╗")
+    print("║" + " " * 62 + "║")
+    print("║" + "  📖 PDF / Word / PPT 翻译器 已启动".ljust(54) + "║")
+    print("║" + " " * 62 + "║")
+    print("║" + "  🌐 在浏览器输入以下网址进入：".ljust(54) + "║")
+    print("║" + " " * 62 + "║")
+    print("║" + f"      {URL}".ljust(62) + "║")
+    print("║" + " " * 62 + "║")
+    print("║" + "  ⚠️  别关这个终端窗口，否则程序停止".ljust(54) + "║")
+    print("║" + "  💡 网址也保存在 “访问网址.txt” 中，随时可查".ljust(52) + "║")
+    print("║" + " " * 62 + "║")
+    print("╚" + "═" * 62 + "╝")
+    print()
+
+    print(f"   结果目录：{os.path.abspath(RESULT_ROOT)}")
+    if DEFAULT_API_KEY:
+        print(f"   API Key：已从 .env 读取（{DEFAULT_API_KEY[:6]}...）")
+    else:
+        print("   API Key：未配置，需在网页填写")
+    if not HAS_OFFICE:
+        print("   ⚠️ 未装 python-docx / python-pptx，Word / PPT 不可用")
+    print()
+
+    n_removed = cleanup_orphan_files()
+    if n_removed:
+        print(f"   已清理 {n_removed} 个冗余/临时文件")
     scan_all_states()
     n = len(MANAGER.all_sorted())
     if n:
-        print(f"ℹ️  已恢复 {n} 个历史任务")
-
-    if not HAS_OFFICE:
-        print("⚠️  未检测到 python-docx / python-pptx，Word / PPT 模式不可用")
-        print("    如需使用，请运行： pip install python-docx python-pptx")
+        print(f"   已恢复 {n} 个历史任务")
+    print()
 
     demo.queue(default_concurrency_limit=None)
     demo.launch(
+        server_name="127.0.0.1",
+        server_port=PORT,
         inbrowser=True,
+        show_error=False,
+        quiet=True,
         allowed_paths=[os.path.abspath(".")],
     )
