@@ -1,21 +1,29 @@
-# 私密
+# ---------- 私密配置 ----------
 .env
 
-# 翻译结果
+# ---------- 翻译结果（可能几百 MB，且涉及版权）----------
 result/
+result_backup/
 
-# 临时文件
-访问网址.txt
-font_test.pdf
-test.py
-
-# Python
+# ---------- 缓存与临时文件 ----------
 __pycache__/
 *.py[cod]
 *.egg-info/
-venv/
-.venv/
+.pytest_cache/
 
-# 系统
+# ---------- 程序运行产物 ----------
+访问网址.txt
+font_test.pdf
+translated_new_*.pdf
+*.tmp.pdf
+
+# ---------- IDE / 编辑器 ----------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---------- 系统 ----------
 .DS_Store
 Thumbs.db
+desktop.ini
