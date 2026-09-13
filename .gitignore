@@ -5,6 +5,16 @@
 result/
 result_backup/
 
+# ---------- 字体文件 ----------
+*.otf
+*.ttf
+*.ttc
+*.otc
+word_type/
+fonts/
+**/word_type/
+**/fonts/
+
 # ---------- 缓存与临时文件 ----------
 __pycache__/
 *.py[cod]
@@ -16,6 +26,7 @@ __pycache__/
 font_test.pdf
 translated_new_*.pdf
 *.tmp.pdf
+*.bak.pdf
 
 # ---------- IDE / 编辑器 ----------
 .vscode/
