@@ -3,15 +3,11 @@ chcp 65001 >nul
 cd /d %~dp0
 
 echo ============================================================
-echo   PDF / Word / PPT 翻译器 启动器
+echo   PDF / Word / PPT 作业解题器 启动器
 echo ============================================================
 echo.
 
-REM ============================================================
-REM  自动探测 conda 安装位置（依次尝试常见路径）
-REM  ★ 修复：找到第一个存在的就 goto 跳出循环，避免多环境时
-REM         被列表靠后的路径覆盖。
-REM ============================================================
+REM ============ 找 conda（跟 重启翻译器.bat 一致：找到第一个就跳出）============
 set "CONDA_ACTIVATE="
 
 for %%P in (
@@ -37,10 +33,6 @@ for %%P in (
 
 :found_conda
 
-REM ============================================================
-REM  如果自动探测失败，尝试从 PATH 里找 conda
-REM  ★ 修复：找到第一个就 break，避免多环境时被覆盖
-REM ============================================================
 if not defined CONDA_ACTIVATE (
     for /f "delims=" %%C in ('where conda 2^>nul') do (
         set "CONDA_EXE=%%C"
@@ -55,20 +47,10 @@ if not defined CONDA_ACTIVATE (
     )
 )
 
-REM ============================================================
-REM  还找不到？让用户手动填
-REM ============================================================
 if not defined CONDA_ACTIVATE (
     echo [错误] 未找到 conda 的 activate.bat
     echo.
-    echo 请手动修改本文件，找到下面这一行：
-    echo     set "CONDA_ACTIVATE=你的路径"
-    echo.
-    echo 如何找路径：
-    echo   1. 打开命令行，执行：where conda
-    echo   2. 得到类似 D:\app\miniconda\conda\Scripts\conda.exe
-    echo   3. 把最后一段 conda.exe 换成 activate.bat，就是这个路径
-    echo.
+    echo 请参照 重启翻译器.bat 的说明手动填路径。
     pause
     exit /b 1
 )
@@ -76,30 +58,30 @@ if not defined CONDA_ACTIVATE (
 echo [信息] 找到 conda：%CONDA_ACTIVATE%
 echo.
 
-REM ============================================================
-REM  激活环境并启动
-REM ============================================================
 call "%CONDA_ACTIVATE%" trans
 
 if errorlevel 1 (
     echo.
     echo [错误] 激活 conda 环境 trans 失败
-    echo 可能原因：
-    echo   1. 环境名不是 trans（请检查：conda env list）
-    echo   2. 环境创建失败或被删除
-    echo.
-    echo 如果想用别的环境名，请编辑本文件，把这一行：
-    echo     call "%CONDA_ACTIVATE%" trans
-    echo 中的 trans 改成你的环境名。
+    echo   1. 检查环境名：conda env list
+    echo   2. 若非 trans，把本文件里的 trans 改成你的环境名
     echo.
     pause
     exit /b 1
 )
 
-echo [信息] conda 环境已激活，启动翻译器……
+echo [信息] 检查 matplotlib / numpy……
+python -c "import matplotlib, numpy" 2>nul
+if errorlevel 1 (
+    echo [信息] 缺失依赖，开始安装（约 30 秒）……
+    python -m pip install matplotlib numpy -i https://pypi.tuna.tsinghua.edu.cn/simple
+    echo.
+)
+
+echo [信息] 启动解题器……
 echo.
 
-python bilingual_app.py
+python homework_app.py
 
 if errorlevel 1 (
     echo.

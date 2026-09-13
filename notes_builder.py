@@ -41,7 +41,22 @@ def _escape_md_cell(s):
 
 
 def _escape_md_inline(s):
-    return (s or "").replace("*", "\\*").replace("_", "\\_").strip()
+    """
+    ★ 优化：补全行首 `#` / `>` 的转义，避免被 Markdown 解释为标题/引用。
+    注意只在字符串最开头处理，避免破坏 "C#" 这类正常内容。
+    """
+    t = (s or "")
+    t = (t.replace("\\", "\\\\")
+          .replace("*", "\\*")
+          .replace("_", "\\_")
+          .replace("|", "\\|")
+          .replace("`", "\\`"))
+    t = t.strip()
+    if t.startswith("#"):
+        t = "\\" + t
+    elif t.startswith(">"):
+        t = "\\" + t
+    return t
 
 
 def build_terms_instruction(reader_profile="", enabled=True):
@@ -96,7 +111,6 @@ def parse_terms_block(terms_raw):
             continue
         term = parts[0]
         translation = parts[1]
-        # ★ 优化：多竖线 note 保留原始 "|"，不合成 " | "
         note = "|".join(parts[2:]).strip() if len(parts) > 2 else ""
         if not term or not translation:
             continue
@@ -646,7 +660,6 @@ def build_notes_html(book_title, global_terms, reader_profile="",
     transition: opacity .16s ease, visibility .16s, transform .18s ease;
     transform: translateY(-4px);
   }}
-  /* ★ 优化：右侧列的浮层自动翻转，避免溢出屏幕 */
   .term-cell:nth-last-child(-n+2) .term-tip {{
     left: auto;
     right: 8px;

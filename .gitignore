@@ -1,40 +1,41 @@
-# ---------- 私密配置 ----------
+# ========== 私密配置（绝对不能上传）==========
 .env
+.env.local
 
-# ---------- 翻译结果（可能几百 MB，且涉及版权）----------
+# ========== 结果目录（体积大，不该上传）==========
+trans_result/
+homework_result/
 result/
-result_backup/
 
-# ---------- 字体文件 ----------
-*.otf
-*.ttf
-*.ttc
-*.otc
-word_type/
-fonts/
-**/word_type/
-**/fonts/
+# ========== 自动生成的文件 ==========
+访问网址.txt
+访问网址_解题器.txt
+font_test.pdf
 
-# ---------- 缓存与临时文件 ----------
+# ========== Python 缓存 ==========
 __pycache__/
 *.py[cod]
+*.so
+.Python
+build/
+dist/
 *.egg-info/
-.pytest_cache/
 
-# ---------- 程序运行产物 ----------
-访问网址.txt
-font_test.pdf
-translated_new_*.pdf
-*.tmp.pdf
-*.bak.pdf
+# ========== 虚拟环境 ==========
+venv/
+env/
+venv_homework/
+.conda/
 
-# ---------- IDE / 编辑器 ----------
+# ========== 编辑器 ==========
 .vscode/
 .idea/
 *.swp
-*.swo
 
-# ---------- 系统 ----------
-.DS_Store
+# ========== 系统文件 ==========
 Thumbs.db
+.DS_Store
 desktop.ini
+
+# ========== 日志 ==========
+*.log

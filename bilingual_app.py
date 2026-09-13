@@ -24,6 +24,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional
 from html import escape
+from functools import lru_cache   # ★ 优化：正则缓存
 
 import pymupdf as fitz
 try:
@@ -35,6 +36,9 @@ from PIL import Image
 from openai import OpenAI
 import gradio as gr
 from dotenv import load_dotenv
+
+# ★ 修复：Pillow 9.4+ 弃用 Image.LANCZOS，用兼容写法
+_RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
 
 try:
     from docx import Document
@@ -82,6 +86,9 @@ FONT_PATH = next((p for p in _DEFAULT_FONT_CANDIDATES
 
 _FONT_EXT = (".otf", ".ttf", ".ttc", ".otc")
 
+# ★ 优化：字体扫描深度从 5 提升到 8
+_FONT_SCAN_MAX_DEPTH = 8
+
 
 def scan_fonts():
     fonts = {}
@@ -91,7 +98,7 @@ def scan_fonts():
         root_dir = os.path.abspath(root_dir)
         for root, dirs, files in os.walk(root_dir):
             depth = root[len(root_dir):].count(os.sep)
-            if depth > 5:
+            if depth > _FONT_SCAN_MAX_DEPTH:
                 dirs[:] = []
                 continue
             for f in files:
@@ -130,7 +137,8 @@ _LANG_FONT_PATTERNS = {
 }
 
 
-# ★ 优化：词边界正则，避免 "KR" 命中 "Krishna" / "Krita" 等误伤
+# ★ 优化：正则结果 lru_cache 缓存，避免每次切换语言都重新编译
+@lru_cache(maxsize=2048)
 def _pattern_hit(name_lower, pat_lower):
     return re.search(r'(?:^|[^a-z])' + re.escape(pat_lower) + r'(?:[^a-z]|$)',
                      name_lower) is not None
@@ -161,8 +169,29 @@ FONT_SIZE_CHOICES = [
 ]
 DEFAULT_FONT_SIZE = 11.0
 
+# ================= 双语 PDF 质量预设 =================
+PDF_QUALITY_PRESETS = {
+    "省流 · 小体积（~1/3）": {
+        "zoom": 1.0, "jpeg": 60, "garbage": 3,
+        "hint": "文字仍清晰，适合自己看 · 300 页 ≈ 60 MB",
+    },
+    "标准 · 推荐": {
+        "zoom": 1.4, "jpeg": 72, "garbage": 3,
+        "hint": "清晰度与体积均衡（默认）· 300 页 ≈ 180 MB",
+    },
+    "清晰": {
+        "zoom": 1.8, "jpeg": 85, "garbage": 2,
+        "hint": "文字边缘锐利，适合放平板 · 300 页 ≈ 330 MB",
+    },
+    "印刷级 · 大体积": {
+        "zoom": 2.5, "jpeg": 92, "garbage": 1,
+        "hint": "接近无损，可打印 · 300 页 ≈ 720 MB",
+    },
+}
+DEFAULT_PDF_QUALITY = "标准 · 推荐"
+
 # ================= 其他配置 =================
-RESULT_ROOT = "result"
+RESULT_ROOT = "trans_result"
 
 RENDER_ZOOM = 2.0
 BILINGUAL_ZOOM = 1.4
@@ -193,7 +222,6 @@ NON_LATIN_SCRIPT_LANGS = ("zh-CN", "zh-TW", "ja", "ko", "ru", "ar")
 CJK_LIKE_LANGS = NON_LATIN_SCRIPT_LANGS
 RTL_LANGS = ("ar",)
 
-# ★ 优化：模块级预编译正则
 _MARK_RE = re.compile(r'\[\[B(\d+)\]\]')
 
 _IO_LOCK = threading.Lock()
@@ -205,7 +233,11 @@ _DATAURL_CACHE_MAX = 200
 _SELECTED_STOP_VALUE = None
 
 _STATE_SAVE_TS = {}
-_STATE_SAVE_LOCK = threading.Lock()
+# ★ 修复：改为 RLock，避免 Ctrl+C 与正常 save 冲突时死锁
+_STATE_SAVE_LOCK = threading.RLock()
+
+# ★ 修复：弹窗只弹一次
+_MODAL_SHOWN = set()
 
 
 # ============================================================
@@ -267,7 +299,10 @@ class TaskState:
     error: str = ""
     estimated_size: int = 0
     current_size: int = 0
-    last_index: int = 0                # ★ 优化：Office 断点续传用
+    last_index: int = 0
+    pdf_quality: str = DEFAULT_PDF_QUALITY
+    make_bilingual: bool = True
+    _preview_scanned: bool = False
     _last_size_ts: float = 0.0
     stop_event: threading.Event = field(default_factory=threading.Event)
     thread: Optional[threading.Thread] = None
@@ -289,7 +324,9 @@ class TaskState:
                 "output_files": files_snap, "error": self.error,
                 "estimated_size": self.estimated_size,
                 "current_size": self.current_size,
-                "last_index": self.last_index,     # ★
+                "last_index": self.last_index,
+                "pdf_quality": self.pdf_quality,
+                "make_bilingual": self.make_bilingual,
             }
 
     def log_msg(self, m):
@@ -338,7 +375,9 @@ class TaskManager:
         return None
 
     def load_from_disk(self, state_dict):
-        tid = state_dict["task_id"]
+        tid = state_dict.get("task_id")
+        if not tid:
+            return
         with self._lock:
             if tid in self._tasks:
                 return
@@ -358,7 +397,9 @@ class TaskManager:
             error=state_dict.get("error", ""),
             estimated_size=state_dict.get("estimated_size", 0),
             current_size=state_dict.get("current_size", 0),
-            last_index=state_dict.get("last_index", 0),    # ★
+            last_index=state_dict.get("last_index", 0),
+            pdf_quality=state_dict.get("pdf_quality", DEFAULT_PDF_QUALITY),
+            make_bilingual=state_dict.get("make_bilingual", True),
         )
         with self._lock:
             self._tasks[tid] = t
@@ -371,7 +412,6 @@ SELECTED_TASK_ID = None
 def save_state(task, force=False):
     if task is None:
         return
-    # ★ 优化：单调时钟，防系统时钟回拨导致节流失效
     now = time.monotonic()
     if not force:
         with _STATE_SAVE_LOCK:
@@ -435,9 +475,7 @@ def cleanup_orphan_files():
                     continue
             except Exception:
                 continue
-            if (f.startswith("translated_new_") and f.endswith(".pdf")) \
-                    or f.endswith(".tmp.pdf") \
-                    or f.endswith(".bak.pdf"):
+            if f.endswith(".tmp.pdf") or f.endswith(".bak.pdf"):
                 try:
                     os.remove(fp)
                     removed += 1
@@ -582,7 +620,8 @@ def _task_disk_size(task):
 
 
 def estimate_output_size(kind, src_path, total_pages,
-                         target_lang="zh-CN", want_terms=True):
+                         target_lang="zh-CN", want_terms=True,
+                         pdf_quality=None, make_bilingual=True):
     try:
         if kind == "pdf":
             if target_lang in ("zh-CN", "zh-TW", "ja", "ko"):
@@ -590,7 +629,20 @@ def estimate_output_size(kind, src_path, total_pages,
             else:
                 per_page = 36 * 1024
             main = int(total_pages * per_page)
-            bilingual = int(total_pages * 220 * 1024)
+
+            if not make_bilingual:
+                bilingual = 0
+            else:
+                base = 220 * 1024
+                preset = PDF_QUALITY_PRESETS.get(
+                    pdf_quality or DEFAULT_PDF_QUALITY,
+                    PDF_QUALITY_PRESETS[DEFAULT_PDF_QUALITY]
+                )
+                zoom = preset.get("zoom", 1.4)
+                jpeg = preset.get("jpeg", 72)
+                scale = (zoom / 1.4) ** 2 * (jpeg / 72)
+                bilingual = int(total_pages * base * scale)
+
             notes = 200 * 1024 if want_terms else 0
             return {
                 "main": main,
@@ -853,7 +905,6 @@ def _build_pptx_preview_html(pairs):
     )
 
 
-# ★ 优化：新增 warning 参数（Office 半成品红条）
 def make_progress_html(done, total, label="",
                        current_size=0, estimated_size=0, warning=""):
     if total <= 0:
@@ -968,12 +1019,7 @@ def build_done_modal_html(task):
         )
 
     lang_label = LANG_NAMES.get(getattr(task, "target_lang", "zh-CN"), "简体中文")
-    actual_size = task.current_size
-    if not actual_size and task.output_files:
-        try:
-            actual_size = _task_disk_size(task)
-        except Exception:
-            actual_size = 0
+    actual_size = task.current_size or 0
     est_size = task.estimated_size or 0
 
     size_pill = ""
@@ -1099,7 +1145,7 @@ def build_done_modal_html(task):
     '''
 
 
-def parse_marked(text, n):
+def parse_marked(text, _n=None):
     result = {}
     if not text:
         return result
@@ -1107,7 +1153,6 @@ def parse_marked(text, n):
         idx = text.rfind(NB.TERM_MARK)
         if idx >= 0:
             text = text[:idx]
-    # ★ 优化：用模块级预编译正则
     matches = list(_MARK_RE.finditer(text))
     for i, m in enumerate(matches):
         idx = int(m.group(1))
@@ -1150,7 +1195,14 @@ def page_is_translated(page, target_lang="zh-CN", src_page=None):
     except Exception:
         return False
 
+    # ★ 修复：空页判断更温和——原文也空则视为已处理
     if not text or not text.strip():
+        if src_page is not None:
+            try:
+                if not src_page.get_text().strip():
+                    return True
+            except Exception:
+                pass
         return False
 
     if src_page is None:
@@ -1164,7 +1216,16 @@ def page_is_translated(page, target_lang="zh-CN", src_page=None):
         pass
 
     total_nonspace = sum(1 for c in text if not c.isspace())
+    # ★ 修复：短页（标题页/扉页）不要误判为未翻译
     if total_nonspace < 5:
+        if src_page is not None:
+            try:
+                src_ns = sum(
+                    1 for c in src_page.get_text() if not c.isspace())
+            except Exception:
+                src_ns = 0
+            if src_ns < 5:
+                return True
         return False
 
     if target_lang in ("zh-CN", "zh-TW"):
@@ -1459,7 +1520,11 @@ def translate_page(client, model, blocks, cache, cache_file,
             else:
                 cached = {int(k): v for k, v in entry.items()}
                 cached_terms = []
-            if translations_look_valid(cached, blocks, target_lang):
+            cached_complete = all(
+                (cached.get(i) or "").strip() for i in range(len(blocks))
+            )
+            if cached_complete and translations_look_valid(
+                    cached, blocks, target_lang):
                 return cached, cached_terms
         except Exception:
             pass
@@ -1499,6 +1564,9 @@ def translate_page(client, model, blocks, cache, cache_file,
                 v = (sub.get(j) or "").strip()
                 if v:
                     parsed[i] = v
+        except RuntimeError as e:
+            if _is_fatal_api_error(str(e)):
+                raise
         except Exception:
             pass
 
@@ -1511,6 +1579,7 @@ def translate_page(client, model, blocks, cache, cache_file,
             if bk in cache and isinstance(cache[bk], str) and cache[bk].strip():
                 parsed[i] = cache[bk]
                 continue
+            tr = ""
             try:
                 r = call_api(client, model, f"[[B0]] {cleaned[i]}",
                              target_lang, stop_event=stop_event,
@@ -1520,14 +1589,22 @@ def translate_page(client, model, blocks, cache, cache_file,
                 else:
                     body2 = r
                 sub = parse_marked(body2, 1)
-                parsed[i] = (sub.get(0) or "").strip()
+                tr = (sub.get(0) or "").strip()
+            except RuntimeError as e:
+                if _is_fatal_api_error(str(e)):
+                    raise
+                tr = ""
             except Exception:
-                parsed[i] = ""
-            cache[bk] = parsed[i]
-            save_json_file(cache_file, cache)
+                tr = ""
+            parsed[i] = tr
+            if tr:
+                cache[bk] = tr
+                save_json_file(cache_file, cache)
 
-    # ★ 优化：翻译结果无效时不写缓存，避免下次续传命中坏结果
-    if translations_look_valid(parsed, blocks, target_lang):
+    parsed_complete = all(
+        (parsed.get(i) or "").strip() for i in range(len(blocks))
+    )
+    if parsed_complete and translations_look_valid(parsed, blocks, target_lang):
         cache[key] = {
             "paragraphs": {str(k): v for k, v in parsed.items()},
             "terms": terms,
@@ -1572,9 +1649,9 @@ def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
             t = _pix_to_pil(t_pix)
             hh = max(o.height, t.height)
             if o.height != hh:
-                o = o.resize((int(o.width * hh / o.height), hh), Image.LANCZOS)
+                o = o.resize((int(o.width * hh / o.height), hh), _RESAMPLE)
             if t.height != hh:
-                t = t.resize((int(t.width * hh / t.height), hh), Image.LANCZOS)
+                t = t.resize((int(t.width * hh / t.height), hh), _RESAMPLE)
             gap = 8
             canvas = Image.new("RGB", (o.width + gap + t.width, hh), (40, 40, 40))
             canvas.paste(o, (0, 0))
@@ -1583,7 +1660,7 @@ def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
                 ratio = PREVIEW_MAX_WIDTH / canvas.width
                 canvas = canvas.resize(
                     (PREVIEW_MAX_WIDTH, int(canvas.height * ratio)),
-                    Image.LANCZOS,
+                    _RESAMPLE,
                 )
             p = os.path.join(paths["preview_dir"], f"compare_{i:04d}.jpg")
             canvas.save(p, "JPEG", quality=PREVIEW_JPEG_QUALITY, optimize=True)
@@ -1596,8 +1673,26 @@ def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
     return preview_imgs
 
 
+def _collect_existing_previews(task):
+    if task is None:
+        return []
+    work = getattr(task, "work_dir", "") or ""
+    if not work:
+        return []
+    d = os.path.join(work, "preview")
+    if not os.path.isdir(d):
+        return []
+    try:
+        files = sorted(glob.glob(os.path.join(d, "compare_*.jpg")))
+    except Exception:
+        return []
+    return [f for f in files
+            if os.path.exists(f) and os.path.getsize(f) > 0]
+
+
 def make_bilingual_pdf(trans_path, paths, task,
-                       n_pages=None, done_pages=None):
+                       n_pages=None, done_pages=None,
+                       zoom=None, jpeg_quality=None, garbage=3):
     if not os.path.exists(trans_path):
         task.log_msg(f"⚠️ 双语 PDF 源不存在：{trans_path}")
         return
@@ -1628,7 +1723,10 @@ def make_bilingual_pdf(trans_path, paths, task,
         out_doc = fitz.open()
         done_count = 0
         n_total = len(pages)
-        zoom_mat = fitz.Matrix(BILINGUAL_ZOOM, BILINGUAL_ZOOM)
+
+        zoom_val = float(zoom) if zoom else BILINGUAL_ZOOM
+        jpeg_val = int(jpeg_quality) if jpeg_quality else BILINGUAL_JPEG_QUALITY
+        zoom_mat = fitz.Matrix(zoom_val, zoom_val)
 
         for idx, pno in enumerate(pages):
             if task.stop_event.is_set():
@@ -1645,10 +1743,10 @@ def make_bilingual_pdf(trans_path, paths, task,
                 hh = max(o.height, t.height)
                 if o.height != hh:
                     o = o.resize((int(o.width * hh / o.height), hh),
-                                 Image.LANCZOS)
+                                 _RESAMPLE)
                 if t.height != hh:
                     t = t.resize((int(t.width * hh / t.height), hh),
-                                 Image.LANCZOS)
+                                 _RESAMPLE)
 
                 gap = 10
                 canvas = Image.new(
@@ -1658,7 +1756,7 @@ def make_bilingual_pdf(trans_path, paths, task,
 
                 buf = io.BytesIO()
                 canvas.save(buf, "JPEG",
-                            quality=BILINGUAL_JPEG_QUALITY, optimize=False)
+                            quality=jpeg_val, optimize=False)
                 img_bytes = buf.getvalue()
                 buf.close()
 
@@ -1682,7 +1780,8 @@ def make_bilingual_pdf(trans_path, paths, task,
 
         if done_count > 0:
             try:
-                saved = safe_save_pdf(out_doc, paths["bilingual_pdf"])
+                saved = safe_save_pdf(out_doc, paths["bilingual_pdf"],
+                                      garbage=garbage)
                 if saved != paths["bilingual_pdf"]:
                     task.log_msg(
                         f"⚠️ 双语 PDF 保存到备用路径：{os.path.basename(saved)}"
@@ -1856,8 +1955,12 @@ def insert_notes_into_pdf(pdf_path, global_terms, book_title,
         except Exception:
             pass
 
+        # ★ 修复：显式指定 from_page / to_page，避免默认 -1 语义歧义
         if position == "front":
-            main_doc.insert_pdf(notes_doc, start_at=0)
+            main_doc.insert_pdf(notes_doc,
+                                from_page=0,
+                                to_page=len(notes_doc) - 1,
+                                start_at=0)
         else:
             main_doc.insert_pdf(notes_doc)
 
@@ -1925,6 +2028,13 @@ def insert_notes_into_pdf(pdf_path, global_terms, book_title,
 # ============================================================
 
 def _docx_replace_para_text(para, new_text):
+    """
+    替换段落文本。
+
+    ★ 说明：多 run 场景下，用第一个 run 的字符格式承载全部译文，
+    其余 run 清空。这是 python-docx 下最稳妥的策略——按比例拆
+    分到各 run 反而会因为译文长度变化导致格式错乱。
+    """
     if para.runs:
         para.runs[0].text = new_text
         for r in para.runs[1:]:
@@ -1956,12 +2066,20 @@ def _docx_insert_after(para, text):
 
 
 def _pptx_set_para_text(para, new_text):
+    """★ 修复：空 run 时用 add_run，避免 para.text 在某些版本上抛异常。"""
     if para.runs:
         para.runs[0].text = new_text
         for r in para.runs[1:]:
             r.text = ""
     else:
-        para.text = new_text
+        try:
+            run = para.add_run()
+            run.text = new_text
+        except Exception:
+            try:
+                para.text = new_text
+            except Exception:
+                pass
 
 
 def _iter_pptx_shapes(shapes):
@@ -2061,6 +2179,17 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
     cache = load_json_file(paths["cache_file"], {})
     done_pages = load_progress_file(paths["progress_file"])
 
+    preset = PDF_QUALITY_PRESETS.get(
+        task.pdf_quality, PDF_QUALITY_PRESETS[DEFAULT_PDF_QUALITY]
+    )
+    if task.make_bilingual:
+        task.log_msg(
+            f"🎨 双语 PDF 质量：{task.pdf_quality}"
+            f"（zoom={preset['zoom']}，JPEG={preset['jpeg']}）"
+        )
+    else:
+        task.log_msg("🎨 已关闭双语 PDF 生成（仅输出译文）")
+
     enable_terms = bool(want_terms and HAS_NOTES and NB is not None)
     terms_file = os.path.join(task.work_dir, "terms.json")
     global_terms = NB.load_terms(terms_file) if enable_terms else {"terms": {}}
@@ -2093,6 +2222,8 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
     est = estimate_output_size(
         "pdf", task.src_path, total_src_pages,
         target_lang=target_lang, want_terms=enable_terms,
+        pdf_quality=task.pdf_quality,
+        make_bilingual=task.make_bilingual,
     )
     task.estimated_size = est.get("total", 0)
     if task.estimated_size:
@@ -2163,7 +2294,6 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
     task.status = "running"
     task.total = limit
     task.label = f"PDF · 目标前 {limit} 页"
-    # ★ 优化：计数器一次算好，后续 O(1) 递增
     task.current = sum(1 for p in done_pages if p <= limit)
     task.log_msg(f"✅ PDF 共 {total} 页，本次目标 {limit} 页，已翻 {task.current} 页")
     save_state(task, force=True)
@@ -2217,8 +2347,12 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
                 reader_profile=reader_profile,
                 want_terms=enable_terms,
             )
-            if not translations_look_valid(trans, blocks, target_lang):
-                task.log_msg(f"⚠️ 第 {page_num} 页翻译结果无效，跳过，稍后重试")
+            trans_complete = all(
+                (trans.get(i) or "").strip() for i in range(len(blocks))
+            )
+            if not trans_complete or not translations_look_valid(
+                    trans, blocks, target_lang):
+                task.log_msg(f"⚠️ 第 {page_num} 页翻译结果不完整，跳过，稍后重试")
                 all_pages_ok = False
                 continue
 
@@ -2230,8 +2364,10 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
             )
             if failed:
                 task.log_msg(
-                    f"⚠️ 第 {page_num} 页有 {failed}/{len(blocks)} 段写入失败（内容可能丢失）"
+                    f"⚠️ 第 {page_num} 页有 {failed}/{len(blocks)} 段写入失败"
+                    f"（该页将进行字符校验，可能回滚重试）"
                 )
+                all_pages_ok = False
 
             if target_lang in NON_LATIN_SCRIPT_LANGS:
                 src_check_page = None
@@ -2395,14 +2531,24 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
         dp = {p for p in done_pages if p <= limit}
         if not dp:
             task.log_msg("ℹ️ 无已翻译页，跳过双语 PDF 生成")
+        elif not task.make_bilingual:
+            task.log_msg("ℹ️ 用户设置不生成双语 PDF，跳过")
+            _add_output(task, paths["output_pdf"])
         else:
             task.log_msg(
-                f"🖼 生成左右对照双语 PDF（{len(dp)} 页，请稍候）……")
+                f"🖼 生成左右对照双语 PDF（{len(dp)} 页，"
+                f"质量「{task.pdf_quality}」，请稍候）……")
             make_bilingual_pdf(
                 paths["output_pdf"], paths, task,
                 n_pages=None, done_pages=dp,
+                zoom=preset["zoom"],
+                jpeg_quality=preset["jpeg"],
+                garbage=preset["garbage"],
             )
-            _add_output(task, paths["output_pdf"], paths["bilingual_pdf"])
+            if os.path.exists(paths["bilingual_pdf"]):
+                _add_output(task, paths["output_pdf"], paths["bilingual_pdf"])
+            else:
+                _add_output(task, paths["output_pdf"])
     except Exception as e:
         task.log_msg(f"⚠️ 收尾生成双语 PDF 失败：{e}")
 
@@ -2458,12 +2604,13 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
             book_title = os.path.splitext(task.src_name)[0]
             lang_label = LANG_NAMES.get(target_lang, target_lang)
 
-            if insert_notes_into_pdf(
-                paths["bilingual_pdf"], global_terms, book_title,
-                reader_profile, limit, lang_label,
-                font_path=font_path, position="front",
-            ):
-                task.log_msg("📎 术语表已插入 bilingual.pdf 开头（带书签）")
+            if task.make_bilingual and os.path.exists(paths["bilingual_pdf"]):
+                if insert_notes_into_pdf(
+                    paths["bilingual_pdf"], global_terms, book_title,
+                    reader_profile, limit, lang_label,
+                    font_path=font_path, position="front",
+                ):
+                    task.log_msg("📎 术语表已插入 bilingual.pdf 开头（带书签）")
 
             try:
                 with open(paths["output_pdf"], "rb") as f:
@@ -2765,6 +2912,7 @@ def _gradio_upload_path(doc_file):
 def start_task(kind, upload_path, real_key, model, trial, target_lang="zh-CN",
                reader_profile="", want_terms=True,
                font_path="", max_font_size=DEFAULT_FONT_SIZE,
+               pdf_quality=DEFAULT_PDF_QUALITY, make_bilingual=True,
                display_name=None, out_subdir=None, warnings=None):
     global SELECTED_TASK_ID
     raw_name = display_name or os.path.basename(upload_path)
@@ -2782,6 +2930,10 @@ def start_task(kind, upload_path, real_key, model, trial, target_lang="zh-CN",
     task = MANAGER.create(kind, src_copy, src_name, paths["out_dir"],
                           paths["work"], target_lang)
     SELECTED_TASK_ID = task.task_id
+
+    task.pdf_quality = pdf_quality or DEFAULT_PDF_QUALITY
+    task.make_bilingual = bool(make_bilingual)
+
     lang_label = LANG_NAMES.get(target_lang, target_lang)
     task.log_msg(f"🆔 任务 {task.task_id} 已创建（{kind}，目标语言：{lang_label}）")
     task.log_msg(f"📁 结果目录：{paths['out_dir']}")
@@ -2814,6 +2966,7 @@ def start_task(kind, upload_path, real_key, model, trial, target_lang="zh-CN",
 def on_start(api_key, model, doc_file, mode, trial, target_lang,
              reader_profile, want_terms,
              font_choice, font_size,
+             pdf_quality, make_bilingual_cb,
              stop_dd_value=None):
     global SELECTED_TASK_ID
 
@@ -2839,6 +2992,9 @@ def on_start(api_key, model, doc_file, mode, trial, target_lang,
         sel_font_size = DEFAULT_FONT_SIZE
     if sel_font_size < 6 or sel_font_size > 24:
         sel_font_size = DEFAULT_FONT_SIZE
+
+    if pdf_quality not in PDF_QUALITY_PRESETS:
+        pdf_quality = DEFAULT_PDF_QUALITY
 
     upload_path, display_name = _gradio_upload_path(doc_file)
     if not upload_path:
@@ -2866,6 +3022,18 @@ def on_start(api_key, model, doc_file, mode, trial, target_lang,
         return on_refresh_fast(stop_dd_value) + ([], keep_upload)
 
     warnings = []
+
+    # ★ 优化：校验文档类型选择与文件后缀是否一致
+    _mode_ext = {
+        "📕 PDF 书籍": ".pdf",
+        "📘 Word 文档": ".docx",
+        "📊 PPT 演示": ".pptx",
+    }
+    if mode in _mode_ext and not name_lower.endswith(_mode_ext[mode]):
+        warnings.append(
+            f"ℹ️ 文档类型选择与文件后缀不一致，已按后缀（{_ext}）处理"
+        )
+
     if kind == "pdf" and (not sel_font_path or not os.path.exists(sel_font_path)):
         warnings.append("⚠️ 未选中有效字体，将使用 PyMuPDF 内置宋体（china-s）")
     if (kind == "pdf" and target_lang in ("ar", "ko")
@@ -2900,6 +3068,8 @@ def on_start(api_key, model, doc_file, mode, trial, target_lang,
                        want_terms=want_terms,
                        font_path=sel_font_path,
                        max_font_size=sel_font_size,
+                       pdf_quality=pdf_quality,
+                       make_bilingual=make_bilingual_cb,
                        display_name=src_name,
                        out_subdir=out_dir_name,
                        warnings=warnings)
@@ -2966,6 +3136,11 @@ def on_load_preview():
 
     imgs = [p for p in (current.preview_images or [])
             if p and os.path.exists(p)]
+    # ★ 优化：内存为空时从磁盘恢复（每次点击都重新扫，但只在真的空时才扫）
+    if not imgs:
+        imgs = _collect_existing_previews(current)
+        if imgs:
+            current.preview_images = imgs
     ph = getattr(current, "preview_html", "") or ""
     files = [os.path.abspath(f) for f in (current.output_files or [])
              if f and os.path.exists(f)]
@@ -2977,8 +3152,6 @@ def build_task_list_html(tasks):
         return ('<div style="padding:18px;color:#a9a49a;font-size:13px;'
                 'text-align:center">暂无任务</div>')
 
-    status_icon = {"queued": "⏳", "running": "▶️", "stopping": "⏸️",
-                   "paused": "🛑", "done": "✅", "error": "❌"}
     status_color = {"queued": "#8b8578", "running": "#0f3d3e",
                     "stopping": "#b8860b", "paused": "#b8860b",
                     "done": "#0f3d3e", "error": "#c0392b"}
@@ -2991,7 +3164,6 @@ def build_task_list_html(tasks):
 
     rows = []
     for t in tasks[:8]:
-        ic = status_icon.get(t.status, "•")
         col = status_color.get(t.status, "#666")
         bg = status_bg.get(t.status, "#f0ebe0")
         stx = status_text.get(t.status, t.status)
@@ -3026,8 +3198,18 @@ def build_task_list_html(tasks):
                        font-size:11.5px;flex-shrink:0">{t.current}/{t.total} ({pct}%)</span>
         </div>''')
 
+    rows_html = "".join(rows)
+
+    # ★ 优化：超过 8 个任务时提示还有多少未显示
+    if len(tasks) > 8:
+        rows_html += (
+            f'<div style="padding:10px 14px;text-align:center;'
+            f'color:#a9a49a;font-size:12px;background:#fdfcf8">'
+            f'… 还有 {len(tasks) - 8} 个任务未显示</div>'
+        )
+
     return (f'<div style="background:#fff;border:1px solid #ebe5d8;'
-            f'border-radius:14px;overflow:hidden">{"".join(rows)}</div>')
+            f'border-radius:14px;overflow:hidden">{rows_html}</div>')
 
 
 def on_refresh_fast(stop_dd_value=None):
@@ -3049,7 +3231,6 @@ def on_refresh_fast(stop_dd_value=None):
             refresh_task_size(current)
         except Exception:
             pass
-        # ★ 优化：Office 半成品时给进度条传 warning
         warning = ""
         if current.status == "paused" and current.error:
             warning = current.error
@@ -3062,6 +3243,11 @@ def on_refresh_fast(stop_dd_value=None):
         log_text = "\n".join(current.log[-40:])
         previews = [p for p in (current.preview_images or [])
                     if p and os.path.exists(p)]
+        if not previews and not getattr(current, "_preview_scanned", False):
+            current._preview_scanned = True
+            previews = _collect_existing_previews(current)
+            if previews:
+                current.preview_images = previews
         preview_html = getattr(current, "preview_html", "") or ""
 
     if current is not None:
@@ -3094,20 +3280,33 @@ def on_refresh_fast(stop_dd_value=None):
     _SELECTED_STOP_VALUE = preserve
     dd_update = gr.update(choices=choices, value=preserve)
 
-    alive_ids = {t.task_id for t in tasks[:50]}
+    # ★ 修复：用全部任务 id 作为 alive 集合。
+    #   之前用 tasks[:50] 会导致超过 50 个任务时，早完成的 done 任务
+    #   被清出 _MODAL_SHOWN → 弹窗反复触发。
+    alive_ids = {t.task_id for t in tasks}
     for k in list(_LAST_PREVIEW_SIG.keys()):
         if k not in alive_ids:
             _LAST_PREVIEW_SIG.pop(k, None)
+    for k in list(_PREVIEW_HTML_CACHE.keys()):
+        if k not in alive_ids:
             _PREVIEW_HTML_CACHE.pop(k, None)
+    for k in list(_STATE_SAVE_TS.keys()):
+        if k not in alive_ids:
+            _STATE_SAVE_TS.pop(k, None)
+    for k in list(_MODAL_SHOWN):
+        if k not in alive_ids:
+            _MODAL_SHOWN.discard(k)
 
-    modal_html = ""
+    # ★ 修复：弹窗只弹一次；默认返回 gr.update() 表示"不改"，
+    #        避免下一次 tick 用空字符串把已弹出的弹窗清掉。
+    modal_html = gr.update()
     for t in tasks:
-        if t.status == "done":
-            if not t.current_size:
-                try:
-                    refresh_task_size(t, force=True)
-                except Exception:
-                    pass
+        if t.status == "done" and t.task_id not in _MODAL_SHOWN:
+            _MODAL_SHOWN.add(t.task_id)
+            try:
+                refresh_task_size(t, force=True)
+            except Exception:
+                pass
             modal_html = build_done_modal_html(t)
             break
 
@@ -3115,7 +3314,6 @@ def on_refresh_fast(stop_dd_value=None):
 
 
 def open_result_folder():
-    global SELECTED_TASK_ID
     current = MANAGER.get(SELECTED_TASK_ID) if SELECTED_TASK_ID else None
     if current is None:
         tasks = MANAGER.all_sorted()
@@ -3140,22 +3338,40 @@ def open_result_folder():
 
 
 # ============================================================
-# 优雅退出
+# 优雅退出（Ctrl+C 秒退）
 # ============================================================
 
+_sigint_count = [0]
+
+
 def _shutdown():
+    """
+    保存所有运行中任务的状态。
+
+    ★ 修复：直接写盘，绕过 _STATE_SAVE_LOCK / _IO_LOCK。
+    信号处理函数跑在主线程，如果此时 worker 线程正持有锁，
+    用锁会阻塞 Ctrl+C，用户感觉"卡住"。反正紧接着就 os._exit(0)，
+    锁没有意义，直接原子写即可。
+
+    ★ 修复：tmp 文件名用 .exit.tmp，避免和 worker 线程的
+    state.json.tmp 撞名（可能导致读到截断的 state.json）。
+    """
     try:
-        running = MANAGER.running()
-        if not running:
-            return
-        for t in running:
-            t.stop_event.set()
-            t.log_msg("🛑 程序退出，正在停止…")
-            save_state(t, force=True)
-        for _ in range(75):
-            if not MANAGER.running():
-                break
-            time.sleep(0.2)
+        for t in MANAGER.running():
+            try:
+                t.stop_event.set()
+                t.log_msg("🛑 程序退出，正在停止…")
+
+                path = os.path.join(t.work_dir, "state.json")
+                os.makedirs(t.work_dir, exist_ok=True)
+                data = t.to_dict()
+
+                tmp = path + ".exit.tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, path)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -3164,8 +3380,16 @@ atexit.register(_shutdown)
 
 
 def _sigint(signum, frame):
+    _sigint_count[0] += 1
+
+    if _sigint_count[0] >= 2:
+        print("\n⏹ 强制退出", flush=True)
+        os._exit(0)
+
+    print("\n⏸ 收到 Ctrl+C，正在保存任务状态……", flush=True)
     _shutdown()
-    sys.exit(0)
+    print("✅ 状态已保存，退出", flush=True)
+    os._exit(0)
 
 
 try:
@@ -3250,7 +3474,7 @@ with gr.Blocks(
         box-shadow: 0 3px 14px rgba(15,61,62,.05);
         display: flex !important;
         flex-direction: column !important;
-        min-height: 720px;
+        min-height: 620px;
     }
     #status_col { background: #fdfcf8 !important; }
 
@@ -3258,6 +3482,24 @@ with gr.Blocks(
         #main_row > .gr-column,
         #main_row > div { min-width: 100% !important; }
         #setup_col, #status_col { min-height: auto; }
+    }
+
+    #log_row {
+        margin-top: 18px !important;
+        background: #ffffff !important;
+        border: 1px solid #ebe5d8 !important;
+        border-radius: 18px !important;
+        padding: 22px 24px !important;
+        box-shadow: 0 3px 14px rgba(15,61,62,.05);
+    }
+
+    #preview_row {
+        margin-top: 18px !important;
+        background: #ffffff !important;
+        border: 1px solid #ebe5d8 !important;
+        border-radius: 18px !important;
+        padding: 22px 24px !important;
+        box-shadow: 0 3px 14px rgba(15,61,62,.05);
     }
 
     label span, .gr-box > label > span {
@@ -3281,7 +3523,8 @@ with gr.Blocks(
         background: transparent !important;
         border: none !important;
     }
-    #setup_col .block, #status_col .block {
+    #setup_col .block, #status_col .block,
+    #log_row .block, #preview_row .block {
         border: none !important;
         box-shadow: none !important;
     }
@@ -3302,18 +3545,19 @@ with gr.Blocks(
         accent-color: #0f3d3e !important; margin-right: 7px !important;
     }
 
-    #trial_cb, #terms_cb {
+    #trial_cb, #terms_cb, #bi_cb {
         background: transparent !important; border: none !important;
         padding: 4px 2px !important;
     }
-    #trial_cb *, #terms_cb * { cursor: pointer !important; }
-    #trial_cb input[type="checkbox"], #terms_cb input[type="checkbox"] {
+    #trial_cb *, #terms_cb *, #bi_cb * { cursor: pointer !important; }
+    #trial_cb input[type="checkbox"], #terms_cb input[type="checkbox"],
+    #bi_cb input[type="checkbox"] {
         -webkit-appearance: checkbox !important; appearance: checkbox !important;
         width: 16px !important; height: 16px !important;
         min-width: 16px !important; max-width: 16px !important;
         accent-color: #0f3d3e !important; margin-right: 9px !important;
     }
-    #trial_cb label, #terms_cb label {
+    #trial_cb label, #terms_cb label, #bi_cb label {
         cursor: pointer !important; font-size: 13.5px !important;
     }
 
@@ -3483,6 +3727,18 @@ with gr.Blocks(
         border-radius: 6px !important;
         word-break: break-all;
     }
+
+    #quality_hint {
+        min-height: 0 !important;
+        margin: -10px 0 4px 0 !important;
+    }
+    #quality_hint p {
+        font-size: 12px !important;
+        color: #8b8578 !important;
+        margin: 0 !important;
+        padding: 0 4px !important;
+        line-height: 1.5 !important;
+    }
     """,
 ) as demo:
 
@@ -3495,7 +3751,7 @@ with gr.Blocks(
         保留原排版<span class="dot">·</span>多任务并行
         <span class="dot">·</span>断点可续<span class="dot">·</span>
         12 种语言<span class="dot">·</span>术语笔记
-        <span class="dot">·</span>字体可选
+        <span class="dot">·</span>质量可选
       </div>
     </div>
     """)
@@ -3508,19 +3764,21 @@ with gr.Blocks(
           <div><b>🌐 语言</b>　简体/繁体中文、英、日、韩、法、德、西、葡、俄、阿、意</div>
           <div><b>🔤 字体</b>　自动扫描 <code>D:\\file\\translate\\word_type</code> 目录下的字体（仅对 PDF 生效）</div>
           <div><b>📏 字号</b>　正文字号上限，实际会根据原文框自动缩小</div>
+          <div><b>🎨 质量</b>　仅对 PDF 的 <code>bilingual.pdf</code> 生效；取消勾选可完全跳过双语 PDF（体积减少约 90%）</div>
           <div><b>📓 术语表</b>　勾选后，术语页会插在 PDF 正文前（带书签）；notes.html 支持鼠标悬停查词 + 点击定位到原文页</div>
-          <div><b>📁 输出位置</b>　译文在 <code>result/&lt;文件名&gt;/</code>，笔记在 <code>_&lt;文件名&gt;/</code></div>
+          <div><b>📁 输出位置</b>　译文在 <code>trans_result/&lt;文件名&gt;/</code>，笔记在 <code>_&lt;文件名&gt;/</code></div>
           <div style="margin-top:10px;padding-top:10px;border-top:1px dashed #e2dccb">
             <b>📚 三种成品</b>
             <div style="margin-left:16px">
               · <code>translated.pdf</code>　纯译文<br>
               · <code>translated_with_notes.pdf</code>　术语页 + 译文<br>
-              · <code>bilingual.pdf</code>　术语页 + 左右对照
+              · <code>bilingual.pdf</code>　术语页 + 左右对照（可关闭）
             </div>
           </div>
         </div>
         """)
 
+    # ================= 上部：左设置 / 右状态 =================
     with gr.Row(equal_height=False, elem_id="main_row"):
 
         with gr.Column(scale=1, min_width=440, elem_id="setup_col"):
@@ -3582,6 +3840,27 @@ with gr.Blocks(
                 )
 
             with gr.Row(equal_height=True):
+                pdf_quality_dd = gr.Dropdown(
+                    choices=list(PDF_QUALITY_PRESETS.keys()),
+                    value=DEFAULT_PDF_QUALITY,
+                    label="🎨 双语 PDF 质量（仅 PDF）",
+                    interactive=True,
+                    elem_id="quality_dd",
+                    scale=3,
+                )
+                make_bilingual_cb = gr.Checkbox(
+                    label="生成左右对照双语 PDF",
+                    value=True,
+                    elem_id="bi_cb",
+                    scale=2,
+                )
+
+            quality_hint = gr.Markdown(
+                value=f"💡 {PDF_QUALITY_PRESETS[DEFAULT_PDF_QUALITY]['hint']}",
+                elem_id="quality_hint",
+            )
+
+            with gr.Row(equal_height=True):
                 want_terms_cb = gr.Checkbox(
                     label="📓 生成术语表与阅读笔记",
                     value=True,
@@ -3633,31 +3912,34 @@ with gr.Blocks(
                     '📊 当前进度</div>')
             progress_bar = gr.HTML(value=make_progress_html(0, 1, "等待开始"))
 
-            gr.HTML('<div class="section-title" style="margin-top:18px">'
-                    '📋 任务日志</div>')
-            log = gr.Textbox(
-                label="",
-                lines=14,
-                interactive=False,
-                show_label=False,
-                elem_id="task_log",
-            )
+    # ================= 中部：任务日志（全宽） =================
+    with gr.Column(elem_id="log_row"):
+        gr.HTML('<div class="section-title">📋 任务日志</div>')
+        log = gr.Textbox(
+            label="",
+            lines=14,
+            interactive=False,
+            show_label=False,
+            elem_id="task_log",
+        )
 
-    with gr.Tabs():
-        with gr.TabItem("👀 效果预览"):
-            gallery = gr.HTML(
-                value=build_preview_html([]),
-                elem_id="preview_box",
-            )
-            load_btn = gr.Button(
-                "🔍 加载当前任务的预览图和下载文件",
-                variant="secondary",
-            )
-        with gr.TabItem("💾 下载文件"):
-            out_files = gr.File(
-                label="", file_count="multiple",
-                interactive=True, show_label=False,
-            )
+    # ================= 下部：效果预览 / 下载文件（全宽 Tabs） =================
+    with gr.Column(elem_id="preview_row"):
+        with gr.Tabs():
+            with gr.TabItem("👀 效果预览"):
+                gallery = gr.HTML(
+                    value=build_preview_html([]),
+                    elem_id="preview_box",
+                )
+                load_btn = gr.Button(
+                    "🔍 加载当前任务的预览图和下载文件",
+                    variant="secondary",
+                )
+            with gr.TabItem("💾 下载文件"):
+                out_files = gr.File(
+                    label="", file_count="multiple",
+                    interactive=False, show_label=False,
+                )
 
     fast_outputs = [task_list_html, progress_bar, log, stop_dd, gallery, modal_html]
     full_outputs = [task_list_html, progress_bar, log, stop_dd,
@@ -3666,9 +3948,10 @@ with gr.Blocks(
     btn.click(
         on_start,
         [api_key, model, doc_file, file_mode, trial, target_lang,
-         reader_profile, want_terms_cb, font_dd, fontsize_dd, stop_dd],
+         reader_profile, want_terms_cb, font_dd, fontsize_dd,
+         pdf_quality_dd, make_bilingual_cb, stop_dd],
         full_outputs,
-        concurrency_limit=None,
+        concurrency_limit=3,
         concurrency_id="start",
     )
     stop_btn.click(on_stop_all, [stop_dd], fast_outputs,
@@ -3679,6 +3962,11 @@ with gr.Blocks(
                       concurrency_limit=None, concurrency_id="manual")
     open_btn.click(open_result_folder, None, [open_hint])
     load_btn.click(on_load_preview, None, [gallery, out_files])
+
+    pdf_quality_dd.change(
+        lambda name: f"💡 {PDF_QUALITY_PRESETS.get(name, {}).get('hint', '')}",
+        [pdf_quality_dd], [quality_hint],
+    )
 
     try:
         timer = gr.Timer(3.0)
@@ -3695,7 +3983,7 @@ with gr.Blocks(
 # main
 # ============================================================
 
-def _find_free_port(start=7860, end=7879):
+def _find_free_port(start=7860, end=7899):   # ★ 优化：扩展端口搜索范围
     for p in range(start, end + 1):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -3708,7 +3996,7 @@ def _find_free_port(start=7860, end=7879):
 
 
 if __name__ == "__main__":
-    PORT = _find_free_port(7860, 7879)
+    PORT = _find_free_port(7860, 7899)
     URL = "http://127.0.0.1:" + str(PORT)
 
     try:
@@ -3748,6 +4036,10 @@ if __name__ == "__main__":
     if FONTS_MAP:
         _default = _default_font_display()
         print(f"   默认字体：{_default}")
+
+    print(f"   双语 PDF 质量预设：{len(PDF_QUALITY_PRESETS)} 档")
+    for _name, _cfg in PDF_QUALITY_PRESETS.items():
+        print(f"      · {_name}（zoom={_cfg['zoom']}, JPEG={_cfg['jpeg']}）")
 
     if not HAS_OFFICE:
         print("   [!] 未装 python-docx / python-pptx，Word / PPT 不可用")

@@ -2,10 +2,20 @@
 import os
 import pymupdf as fitz
 
-FONT_PATH = r"D:\file\translate\word_type\09_SourceHanSerifSC\OTF\SimplifiedChinese\SourceHanSerifSC-Regular.otf"
+# ★ 优化：优先读 .env 里的 TRANSLATE_FONT_PATH，没有再用默认路径
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    FONT_PATH = os.getenv("TRANSLATE_FONT_PATH", "").strip()
+except Exception:
+    FONT_PATH = ""
+
+if not FONT_PATH:
+    FONT_PATH = r"D:\file\translate\word_type\09_SourceHanSerifSC\OTF\SimplifiedChinese\SourceHanSerifSC-Regular.otf"
 
 print("=" * 50)
 print("1. 字体文件是否存在：", os.path.exists(FONT_PATH))
+print("   使用的字体路径：", FONT_PATH)
 if os.path.exists(FONT_PATH):
     print("   文件大小：", os.path.getsize(FONT_PATH), "字节")
 else:
@@ -16,6 +26,8 @@ else:
             print("      文件夹里实际是：", f)
     else:
         print("      连文件夹都不存在：", d)
+    print()
+    print("   提示：可以在 .env 里设置 TRANSLATE_FONT_PATH 指向正确字体")
 
 print("=" * 50)
 print("2. 测试字体嵌入……")
