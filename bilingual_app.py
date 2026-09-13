@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-PDF / Word / PPT 翻译器（网页版 · 多任务并行 + 单独停止 + 断点续传）
+PDF / Word / PPT 翻译器
+新增：
+  1) 续传时以 translated.pdf 实际内容为准，重建 done_pages
+  2) 每页翻译后校验，空翻译不算完成
+  3) 每 10 页落盘一次，崩溃最多丢 10 页
 """
 
 import os
@@ -55,6 +59,15 @@ PREVIEW_PAGES = 5
 PREVIEW_MAX_WIDTH = 1400
 PREVIEW_JPEG_QUALITY = 88
 PREVIEW_PARAS = 5
+
+# 【新增】每多少页落盘一次
+CHECKPOINT_EVERY = 10
+
+# 【新增】判定一页“翻译过”的最少中文字符数
+PAGE_CN_THRESHOLD = 20
+
+# 【新增】判定一次 API 返回有效的最少段落占比
+VALID_RATIO_THRESHOLD = 0.3
 
 _IO_LOCK = threading.Lock()
 _LAST_PREVIEW_SIG = {}
@@ -516,6 +529,44 @@ def parse_marked(text, n):
 
 
 # ============================================================
+# 【新增】内容校验工具
+# ============================================================
+
+def page_is_translated(page):
+    """
+    判断 translated.pdf 里的一页是否真的翻译过。
+    标准：页面文本中至少包含 PAGE_CN_THRESHOLD 个中文字符。
+    """
+    try:
+        text = page.get_text()
+    except Exception:
+        return False
+    cn = 0
+    for c in text:
+        if '\u4e00' <= c <= '\u9fff':
+            cn += 1
+            if cn >= PAGE_CN_THRESHOLD:
+                return True
+    return False
+
+
+def translations_look_valid(translations, blocks):
+    """
+    判断一次 API 返回的 translations 是否可用。
+    要求：至少 VALID_RATIO_THRESHOLD 比例的段落有中文。
+    """
+    if not translations or not blocks:
+        return False
+    valid = 0
+    for i in range(len(blocks)):
+        v = (translations.get(i) or "").strip()
+        if v and any('\u4e00' <= c <= '\u9fff' for c in v):
+            valid += 1
+    need = max(1, int(len(blocks) * VALID_RATIO_THRESHOLD))
+    return valid >= need
+
+
+# ============================================================
 # API
 # ============================================================
 
@@ -559,7 +610,10 @@ def translate_page(client, model, blocks, cache, cache_file):
     key = "pg_" + h(marked)
     if key in cache:
         try:
-            return {int(k): v for k, v in cache[key].items()}
+            cached = {int(k): v for k, v in cache[key].items()}
+            # 命中缓存也要校验，否则残留的空缓存会一直命中
+            if translations_look_valid(cached, blocks):
+                return cached
         except Exception:
             pass
 
@@ -569,7 +623,7 @@ def translate_page(client, model, blocks, cache, cache_file):
     missing = [i for i in range(len(blocks)) if i not in parsed or not parsed[i].strip()]
     for i in missing:
         bk = "bk_" + h(blocks[i][4])
-        if bk in cache and cache[bk].strip():
+        if bk in cache and isinstance(cache[bk], str) and cache[bk].strip():
             parsed[i] = cache[bk]
             continue
         r = call_api(client, model, f"[[B0]] {blocks[i][4].strip()}")
@@ -686,12 +740,8 @@ def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
 
 def make_bilingual_pdf(trans_path, paths, task, n_pages=None):
     """
-    生成左右对照双语 PDF。
-
-    n_pages=None  → 生成【全部页】（用于最终成品 bilingual.pdf）
-    n_pages=N     → 只生成前 N 页（用于过程中小快照）
-
-    实现上用 PyMuPDF 逐页写入，内存占用恒定，不受总页数影响。
+    一次性生成左右对照双语 PDF。
+    n_pages=None → 全部页。逐页写入，内存占用恒定。
     """
     if not os.path.exists(trans_path):
         task.log_msg(f"⚠️ 双语 PDF 源不存在：{trans_path}")
@@ -721,6 +771,7 @@ def make_bilingual_pdf(trans_path, paths, task, n_pages=None):
         done_count = 0
         for i in range(n):
             if task.stop_event.is_set():
+                task.log_msg(f"⏸ 双语 PDF 生成时收到停止信号，已生成 {done_count} 页")
                 break
             try:
                 o_pix = orig[i].get_pixmap(matrix=fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM))
@@ -737,7 +788,6 @@ def make_bilingual_pdf(trans_path, paths, task, n_pages=None):
                 canvas.paste(o, (0, 0))
                 canvas.paste(t, (o.width + gap, 0))
 
-                # 编码成 JPEG 字节流，直接喂给 PDF，不在内存里留 Image 对象
                 buf = io.BytesIO()
                 canvas.save(buf, "JPEG", quality=PREVIEW_JPEG_QUALITY, optimize=True)
                 img_bytes = buf.getvalue()
@@ -747,11 +797,13 @@ def make_bilingual_pdf(trans_path, paths, task, n_pages=None):
                 page = out_doc.new_page(width=w, height=page_h)
                 page.insert_image(fitz.Rect(0, 0, w, page_h), stream=img_bytes)
 
-                # 立即释放
                 canvas.close()
                 o.close()
                 t.close()
                 done_count += 1
+
+                if done_count % 50 == 0:
+                    task.log_msg(f"📐 双语 PDF 生成中……{done_count}/{n} 页")
             except Exception as e:
                 task.log_msg(f"⚠️ 双语 PDF 第 {i+1} 页失败：{e}")
                 continue
@@ -760,7 +812,6 @@ def make_bilingual_pdf(trans_path, paths, task, n_pages=None):
         trans.close()
 
         if done_count > 0:
-            # 先删旧文件，避免异常时留下上一版 5 页的残影
             try:
                 if os.path.exists(paths["bilingual_pdf"]):
                     os.remove(paths["bilingual_pdf"])
@@ -821,13 +872,14 @@ def pdf_worker(task, paths, real_key, model, trial):
     cache = load_json_file(paths["cache_file"], {})
     done_pages = load_progress_file(paths["progress_file"])
 
+    # ---------- 打开译文 PDF（续传 or 新建） ----------
     pdf_exists = os.path.exists(paths["output_pdf"])
     if done_pages and pdf_exists:
         try:
             with open(paths["output_pdf"], "rb") as f:
                 data = f.read()
             doc = fitz.open(stream=data, filetype="pdf")
-            task.log_msg(f"📂 从已翻译 PDF 续传（已翻 {len(done_pages)} 页，本次不重做）")
+            task.log_msg(f"📂 从已翻译 PDF 续传（进度记录说已翻 {len(done_pages)} 页）")
         except Exception as e:
             task.log_msg(f"⚠️ 打开旧译文失败，从头开始：{e}")
             doc = fitz.open(task.src_path)
@@ -840,6 +892,39 @@ def pdf_worker(task, paths, real_key, model, trial):
             done_pages = set()
             save_progress_file(paths["progress_file"], done_pages)
 
+    # ---------- 【新增】内容校验：以 translated.pdf 实际内容重建 done_pages ----------
+    if pdf_exists:
+        try:
+            orig_check = fitz.open(task.src_path)
+            actually_done = set()
+            checked = 0
+            for i in range(min(len(doc), len(orig_check))):
+                checked += 1
+                if page_is_translated(doc[i]):
+                    actually_done.add(i + 1)
+            orig_check.close()
+
+            reported = len(done_pages)
+            actual = len(actually_done)
+
+            task.log_msg(f"🔎 内容校验：译文共 {checked} 页，其中含中文的 {actual} 页")
+
+            if reported != actual:
+                missing = sorted(set(range(1, checked + 1)) - actually_done)
+                task.log_msg(f"⚠️ 进度记录说已翻 {reported} 页，但实际只有 {actual} 页含中文")
+                if missing:
+                    task.log_msg(f"   待补翻页码前 20 个：{missing[:20]}{'...' if len(missing) > 20 else ''}")
+                    task.log_msg(f"   共 {len(missing)} 页需要补翻")
+                else:
+                    task.log_msg(f"   进度多余 {reported - actual} 页，已修正")
+            else:
+                task.log_msg(f"✅ 进度与实际内容一致")
+
+            done_pages = actually_done
+            save_progress_file(paths["progress_file"], done_pages)
+        except Exception as e:
+            task.log_msg(f"⚠️ 内容校验失败（不影响继续）：{e}")
+
     total = len(doc)
     limit = min(5, total) if trial else total
 
@@ -847,17 +932,14 @@ def pdf_worker(task, paths, real_key, model, trial):
     task.total = limit
     task.label = f"PDF · 目标前 {limit} 页"
     task.current = len([p for p in done_pages if p <= limit])
-    task.log_msg(f"✅ PDF 共 {total} 页，本次目标前 {limit} 页")
+    task.log_msg(f"✅ PDF 共 {total} 页，本次目标 {limit} 页，已翻 {task.current} 页")
     save_state(task)
 
+    # ---------- 初始预览 ----------
     if pdf_exists:
         try:
-            task.log_msg("🖼 生成前 5 页预览……")
             task.preview_images = render_preview_only(paths["output_pdf"], paths, task)
-            make_bilingual_pdf(paths["output_pdf"], paths, task, n_pages=PREVIEW_PAGES)
-            task.output_files = [paths["output_pdf"], paths["bilingual_pdf"]]
-            save_state(task)
-            task.log_msg(f"✅ 预览图就绪（{len(task.preview_images)} 张）")
+            task.output_files = [paths["output_pdf"]]
             save_state(task)
         except Exception as e:
             task.log_msg(f"⚠️ 初始预览生成失败：{e}")
@@ -888,9 +970,18 @@ def pdf_worker(task, paths, real_key, model, trial):
             save_state(task)
             continue
 
+        # ---------- 翻译这一页 ----------
         try:
             trans = translate_page(client, model, blocks, cache, paths["cache_file"])
+            # 【新增】校验 API 结果
+            if not translations_look_valid(trans, blocks):
+                task.log_msg(f"⚠️ 第 {page_num} 页翻译结果无效（有效段落太少），跳过，稍后重试")
+                continue
             apply_translations(page, blocks, trans)
+            # 【新增】校验写入后是否有中文
+            if not page_is_translated(page):
+                task.log_msg(f"⚠️ 第 {page_num} 页写入后未检出中文，跳过，稍后重试")
+                continue
         except RuntimeError as e:
             error_msg = str(e)
             break
@@ -906,19 +997,22 @@ def pdf_worker(task, paths, real_key, model, trial):
         task.log_msg(f"✅ 第 {page_num} 页完成（本次新增 {len(newly)} 页）")
         save_state(task)
 
-        if page_num <= PREVIEW_PAGES:
+        # ---------- 【新增】每 CHECKPOINT_EVERY 页落盘一次 ----------
+        should_save = (page_num <= PREVIEW_PAGES) or (page_num % CHECKPOINT_EVERY == 0)
+        if should_save:
             try:
                 safe_save_pdf(doc, paths["output_pdf"])
-                task.preview_images = render_preview_only(paths["output_pdf"], paths, task)
-                # 过程小快照：只生成前 5 页，避免频繁渲染整本
-                make_bilingual_pdf(paths["output_pdf"], paths, task, n_pages=PREVIEW_PAGES)
-                task.output_files = [paths["output_pdf"], paths["bilingual_pdf"]]
+                task.log_msg(f"💾 已落盘（前 {page_num} 页）")
+                if page_num <= PREVIEW_PAGES:
+                    task.preview_images = render_preview_only(paths["output_pdf"], paths, task)
+                task.output_files = [paths["output_pdf"]]
                 save_state(task)
-            except Exception:
-                pass
+            except Exception as e:
+                task.log_msg(f"⚠️ 落盘失败：{e}")
     else:
         completed = True
 
+    # ---------- 收尾：保存译文 PDF ----------
     try:
         safe_save_pdf(doc, paths["output_pdf"])
     except Exception as e:
@@ -936,19 +1030,24 @@ def pdf_worker(task, paths, real_key, model, trial):
         save_state(task)
         return
 
-    # 收尾：生成完整预览图 + 完整双语 PDF（全部页）
+    # ---------- 收尾：一次性生成全本双语对照 PDF ----------
     try:
-        task.log_msg("🖼 生成左右对照双语 PDF（全部已翻页，请稍候）……")
-        task.preview_images = render_preview_only(paths["output_pdf"], paths, task)
-        make_bilingual_pdf(paths["output_pdf"], paths, task, n_pages=None)   # ← 全部页
+        task.log_msg(f"🖼 生成左右对照双语 PDF（{len(done_pages)} 页，请稍候）……")
+        make_bilingual_pdf(paths["output_pdf"], paths, task, n_pages=None)
         task.output_files = [paths["output_pdf"], paths["bilingual_pdf"]]
     except Exception as e:
         task.log_msg(f"⚠️ 收尾生成双语 PDF 失败：{e}")
 
+    # ---------- 网页预览刷新 ----------
+    try:
+        task.preview_images = render_preview_only(paths["output_pdf"], paths, task)
+    except Exception:
+        pass
+
     if completed:
         task.status = "done"
         task.label = "全部完成"
-        task.log_msg(f"🎉 全部完成！共 {len(done_pages)} 页")
+        task.log_msg(f"🎉 全部完成！共 {len(done_pages)} 页，最大页码 {max(done_pages)}")
     elif task.stop_event.is_set():
         task.status = "paused"
         task.label = f"已暂停（半成品），共翻 {len(done_pages)} 页"
@@ -1268,7 +1367,6 @@ def start_task(kind, upload_path, real_key, model, trial):
 
 
 def on_start(api_key, model, doc_file, mode, trial):
-    """自动按文件后缀判断类型，忽略页面上的选择"""
     global SELECTED_TASK_ID
 
     real_key = (api_key or "").strip() or DEFAULT_API_KEY
@@ -1279,7 +1377,6 @@ def on_start(api_key, model, doc_file, mode, trial):
     if model not in ("deepseek-chat", "deepseek-reasoner"):
         model = "deepseek-chat"
 
-    # 根据后缀自动判断类型
     name_lower = (doc_file.name or "").lower()
 
     if name_lower.endswith(".pdf"):
@@ -1689,9 +1786,13 @@ with gr.Blocks(
         <br>
         <span class="k">⏸ 停止</span>下方可<b>单独停止</b>某个任务，也可<b>一键停止全部</b>。
         <br>
-        <span class="k">👀 预览</span>PDF 显示前 5 页左右对照；Word / PPT 显示前 5 段文本对照。
+        <span class="k">🔎 自愈</span>续传时自动检查译文 PDF 中每一页<b>是否真的含中文</b>，
+        缺页自动补翻（有缓存则秒完成，不重复扣费）。
         <br>
-        <span class="k">📚 成品</span><code>translated.pdf</code>（纯译文）和 <code>bilingual.pdf</code>（左右对照，<b>全部页</b>）
+        <span class="k">💾 落盘</span>每 10 页自动保存一次译文，崩溃最多丢 10 页进度。
+        <br>
+        <span class="k">📚 成品</span><code>translated.pdf</code>（纯译文，实时更新）
+        和 <code>bilingual.pdf</code>（左右对照，翻完后一次性生成）
       </div>
     </div>
     """)
@@ -1725,7 +1826,7 @@ with gr.Blocks(
     )
     trial = gr.Checkbox(
         label="🧪 试翻模式：PDF 只翻前 5 页（对 Word / PPT 无效）",
-        value=False,          # ← 默认关闭，全本翻译
+        value=False,
         elem_id="trial_cb",
     )
 
