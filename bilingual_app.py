@@ -1,70 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 PDF / Word / PPT 翻译器
-- 字体可选（扫描 word_type 目录）
-- 正文字号可选
-- 术语页插在正文前 + 自动重建书签
-- 修复：RTL 排版、字体自动匹配、文本溢出、双语PDF落盘、Word表格双语等
-
-===== 本次修订 (2026-09) =====
-[FIX-1] prepare_paths 新增 out_subdir 参数，on_start 的 hash 目录真正生效。
-[FIX-2] apply_translations 改为「先筛选有译文的块，再统一 redact」。
-[FIX-3] page_is_translated 新增 src_page 参数，修复 CJK 原文误判。
-[FIX-4] TaskState 内置 RLock，log_msg / to_dict 线程安全。
-[FIX-5] 端口自动回退 7860..7879。
-[FIX-6] cleanup_orphan_files 补上 .bak.pdf 清理。
-
-===== 二次修订 =====
-[FIX-7]  pdf_worker 翻译后校验带 src_page，失败自动回滚原页。
-[FIX-8]  translate_batch_office 对余额/Key 等致命错误直接向上抛，
-         批量全失败也抛 RuntimeError，避免静默标 done。
-[FIX-9]  on_start 的字体/语言告警改写到新任务日志（warnings 参数）。
-[FIX-10] output_files 统一走 _add_output，断点续传不再丢历史产物。
-[FIX-11] img_to_base64_dataurl 缓存键改用 (path, mtime_ns, size)。
-[FIX-12] 预览 HTML 的 escape 兜底 None。
-[FIX-13] build_notes_pdf 空 write 改为直接推进 y。
-[FIX-14] CJK_LIKE_LANGS 语义澄清为 NON_LATIN_SCRIPT_LANGS 别名。
-
-===== 三次修订 (2026-09-13) =====
-[B-1] translate_batch_office 逐条重试：break → continue，
-      避免非致命错误导致整批剩余段落被静默丢弃。
-[B-2] translate_batch_office 返回 (results, fail_count)，
-      docx/pptx worker 依据 fail_count 判定 done / paused。
-      fail_count 只在函数末尾统一统计一次，避免双计。
-[B-3] on_start / start_task 对 src_name 走 safe_dirname，防路径穿越。
-[B-5] page_is_translated 在 src_page is None 时保守返回 True，
-      避免中文原书被误判为「已翻译」。
-[B-6] PDF 翻译后回滚失败 → 终止任务，避免 PDF 结构损坏。
-[B-8] 韩文 Unicode 上界 \ud7af → \ud7a3。
-[B-10] _interruptible_sleep 返回 bool，调用方可感知停止。
-[B-14] save_state 增加基于时间的节流（每任务 1.5s）。
-
-===== 四次修订 (2026-09-13 修 bug) =====
-[F1]  safe_save_pdf 返回的备用路径被调用方接收并同步到 paths，
-      避免 .bak.pdf 落盘后各处仍按原路径查找导致「产物消失」。
-[F2]  PDF 页面回滚改用 insert_pdf + delete_page(pno+1)，
-      避免末页 delete→insert 的边界问题，保留原页矢量内容。
-[F3]  insert_notes_into_pdf 全函数 try/finally，os.replace 加重试，
-      避免异常时 notes_doc 未关闭；并补齐 .tmp.pdf 清理。
-[F4]  find_active_by_out_dir 用 os.path.normcase 比较路径，
-      避免 Windows 下 D:\File vs d:\file 导致重复任务。
-[F5]  TaskState.log_msg 原地修剪（del self.log[:-200]），
-      不再重绑定列表 → 读侧切片不会读到撕裂状态。
-[F6]  _add_output 加 task._lock，防止多回调并发写 output_files。
-[F7]  safe_dirname 先 replace("..","_") 再 rstrip(". ")，
-      否则 "foo.." 会被先 rstrip 成 "foo" 使 replace 失效。
-[F8]  _shutdown 改为最多 2s 轮询 running()，不再 sleep(0.8) 硬阻塞。
-[F9]  _interruptible_sleep 先判 remaining<=0 再 sleep，
-      避免超时后多睡一次 50ms。
-[F10] docx_worker 去重改用 cell._tc 本身入 set（lxml 元素身份稳定）。
-[F11] pptx_worker 递归处理 group shape 内的文本框。
-[F12] pdf_worker 打开原 PDF 失败时写日志，不再静默跳过校验。
-[F13] translate_batch_office 用独立 failed set 记录失败下标，
-      避免 results[i] 混用「本来就 None」与「失败」两种状态。
 """
 
-import os
 import sys
+sys.dont_write_bytecode = True
+
+import os
 import json
 import time
 import re
@@ -78,6 +20,7 @@ import threading
 import uuid
 import io
 import socket
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional
 from html import escape
@@ -187,6 +130,12 @@ _LANG_FONT_PATTERNS = {
 }
 
 
+# ★ 优化：词边界正则，避免 "KR" 命中 "Krishna" / "Krita" 等误伤
+def _pattern_hit(name_lower, pat_lower):
+    return re.search(r'(?:^|[^a-z])' + re.escape(pat_lower) + r'(?:[^a-z]|$)',
+                     name_lower) is not None
+
+
 def _auto_pick_font(target_lang, user_font_path):
     if user_font_path and os.path.exists(user_font_path):
         return user_font_path
@@ -195,7 +144,7 @@ def _auto_pick_font(target_lang, user_font_path):
         for name in sorted(FONTS_MAP.keys()):
             low = name.lower()
             for pat in patterns:
-                if pat.lower() in low:
+                if _pattern_hit(low, pat.lower()):
                     return FONTS_MAP[name]
     return FONT_PATH or ""
 
@@ -214,7 +163,11 @@ DEFAULT_FONT_SIZE = 11.0
 
 # ================= 其他配置 =================
 RESULT_ROOT = "result"
+
 RENDER_ZOOM = 2.0
+BILINGUAL_ZOOM = 1.4
+BILINGUAL_JPEG_QUALITY = 72
+
 PREVIEW_PAGES = 5
 PREVIEW_MAX_WIDTH = 1400
 PREVIEW_JPEG_QUALITY = 88
@@ -223,11 +176,11 @@ PREVIEW_PARAS = 5
 CHECKPOINT_EVERY = 10
 PAGE_CN_THRESHOLD = 20
 PAGE_CN_RATIO = 0.2
-VALID_RATIO_THRESHOLD = 0.3
-OFFICE_BATCH_SIZE = 20
+VALID_RATIO_THRESHOLD = 0.5
 
-# [B-14] save_state 节流间隔（秒）
+OFFICE_BATCH_SIZE = 20
 STATE_SAVE_INTERVAL = 1.5
+SIZE_REFRESH_INTERVAL = 5.0
 
 LANG_NAMES = {
     "zh-CN": "简体中文", "zh-TW": "繁体中文",
@@ -237,18 +190,20 @@ LANG_NAMES = {
 }
 
 NON_LATIN_SCRIPT_LANGS = ("zh-CN", "zh-TW", "ja", "ko", "ru", "ar")
-CJK_LIKE_LANGS = NON_LATIN_SCRIPT_LANGS  # 兼容旧名
-
+CJK_LIKE_LANGS = NON_LATIN_SCRIPT_LANGS
 RTL_LANGS = ("ar",)
+
+# ★ 优化：模块级预编译正则
+_MARK_RE = re.compile(r'\[\[B(\d+)\]\]')
 
 _IO_LOCK = threading.Lock()
 _CREATE_LOCK = threading.Lock()
 _LAST_PREVIEW_SIG = {}
 _PREVIEW_HTML_CACHE = {}
-_DATAURL_CACHE = {}
+_DATAURL_CACHE = OrderedDict()
+_DATAURL_CACHE_MAX = 200
 _SELECTED_STOP_VALUE = None
 
-# [B-14] save_state 节流：{task_id: last_save_ts}
 _STATE_SAVE_TS = {}
 _STATE_SAVE_LOCK = threading.Lock()
 
@@ -310,6 +265,10 @@ class TaskState:
     preview_images: list = field(default_factory=list)
     preview_html: str = ""
     error: str = ""
+    estimated_size: int = 0
+    current_size: int = 0
+    last_index: int = 0                # ★ 优化：Office 断点续传用
+    _last_size_ts: float = 0.0
     stop_event: threading.Event = field(default_factory=threading.Event)
     thread: Optional[threading.Thread] = None
     _lock: threading.RLock = field(
@@ -319,7 +278,7 @@ class TaskState:
     def to_dict(self):
         with self._lock:
             log_snap = list(self.log[-60:])
-            files_snap = list(self.output_files)
+            files_snap = list(self.output_files or [])
             return {
                 "task_id": self.task_id, "kind": self.kind,
                 "src_name": self.src_name, "out_dir": self.out_dir,
@@ -328,10 +287,12 @@ class TaskState:
                 "current": self.current, "total": self.total,
                 "label": self.label, "log": log_snap,
                 "output_files": files_snap, "error": self.error,
+                "estimated_size": self.estimated_size,
+                "current_size": self.current_size,
+                "last_index": self.last_index,     # ★
             }
 
     def log_msg(self, m):
-        # [F5] 原地修剪，不重绑定列表，避免读侧切片看到撕裂状态
         with self._lock:
             self.log.append(m)
             if len(self.log) > 200:
@@ -368,7 +329,6 @@ class TaskManager:
                     if t.status in ("queued", "running", "stopping")]
 
     def find_active_by_out_dir(self, out_dir):
-        # [F4] Windows 下大小写不敏感
         target = os.path.normcase(os.path.abspath(out_dir))
         with self._lock:
             for t in self._tasks.values():
@@ -394,8 +354,11 @@ class TaskManager:
             total=state_dict.get("total", 0),
             label=state_dict.get("label", ""),
             log=state_dict.get("log", []),
-            output_files=state_dict.get("output_files", []),
+            output_files=state_dict.get("output_files", []) or [],
             error=state_dict.get("error", ""),
+            estimated_size=state_dict.get("estimated_size", 0),
+            current_size=state_dict.get("current_size", 0),
+            last_index=state_dict.get("last_index", 0),    # ★
         )
         with self._lock:
             self._tasks[tid] = t
@@ -406,10 +369,10 @@ SELECTED_TASK_ID = None
 
 
 def save_state(task, force=False):
-    """[B-14] 增加节流；force=True 可强制写盘（如状态变化）。"""
     if task is None:
         return
-    now = time.time()
+    # ★ 优化：单调时钟，防系统时钟回拨导致节流失效
+    now = time.monotonic()
     if not force:
         with _STATE_SAVE_LOCK:
             last = _STATE_SAVE_TS.get(task.task_id, 0.0)
@@ -434,7 +397,6 @@ def save_state(task, force=False):
 
 
 def _add_output(task, *paths_):
-    """[F6] 统一往 task.output_files 里 append（去重），加锁。"""
     if task is None:
         return
     with task._lock:
@@ -490,7 +452,6 @@ def cleanup_orphan_files():
 # ============================================================
 
 def safe_dirname(name):
-    # [F7] 先 replace("..","_")，再 rstrip(". ")，否则 "foo.." 会先被 rstrip 掉点
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name or "").strip()
     name = name.replace("..", "_")
     name = name.rstrip(". ")
@@ -574,8 +535,100 @@ def clear_dir_preview(folder):
             pass
 
 
-def safe_save_pdf(doc, out_path, retries=5):
-    """保存 PDF；返回实际落盘路径（可能因占用回退到 .bak.pdf）。"""
+# ============================================================
+# 体积预估 / 显示
+# ============================================================
+
+def fmt_size(n):
+    try:
+        n = float(n)
+    except Exception:
+        return "—"
+    if n <= 0:
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _sum_dir_size(folder, skip_subdir="_work"):
+    total = 0
+    if not folder or not os.path.isdir(folder):
+        return total
+    for root, dirs, files in os.walk(folder):
+        if skip_subdir and skip_subdir in dirs:
+            dirs.remove(skip_subdir)
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except Exception:
+                pass
+    return total
+
+
+def _task_disk_size(task):
+    total = 0
+    for f in list(task.output_files or []):
+        try:
+            if f and os.path.exists(f):
+                total += os.path.getsize(f)
+        except Exception:
+            pass
+    if total > 0:
+        return total
+    return _sum_dir_size(task.out_dir)
+
+
+def estimate_output_size(kind, src_path, total_pages,
+                         target_lang="zh-CN", want_terms=True):
+    try:
+        if kind == "pdf":
+            if target_lang in ("zh-CN", "zh-TW", "ja", "ko"):
+                per_page = 26 * 1024
+            else:
+                per_page = 36 * 1024
+            main = int(total_pages * per_page)
+            bilingual = int(total_pages * 220 * 1024)
+            notes = 200 * 1024 if want_terms else 0
+            return {
+                "main": main,
+                "bilingual": bilingual,
+                "notes": notes,
+                "total": main + bilingual + notes,
+            }
+        elif kind in ("docx", "pptx"):
+            try:
+                src_size = os.path.getsize(src_path)
+            except Exception:
+                src_size = 300 * 1024
+            out = int(src_size * 1.2)
+            return {
+                "main": out,
+                "bilingual": out,
+                "notes": 0,
+                "total": out * 2,
+            }
+    except Exception:
+        pass
+    return {"main": 0, "bilingual": 0, "notes": 0, "total": 0}
+
+
+def refresh_task_size(task, force=False):
+    if task is None:
+        return
+    now = time.time()
+    if not force and (now - task._last_size_ts) < SIZE_REFRESH_INTERVAL:
+        return
+    task._last_size_ts = now
+    try:
+        task.current_size = _task_disk_size(task)
+    except Exception:
+        pass
+
+
+def safe_save_pdf(doc, out_path, retries=5, garbage=3):
     tmp_path = out_path + ".tmp.pdf"
     try:
         if os.path.exists(tmp_path):
@@ -583,7 +636,7 @@ def safe_save_pdf(doc, out_path, retries=5):
     except Exception:
         pass
 
-    doc.save(tmp_path, deflate=True, garbage=3)
+    doc.save(tmp_path, deflate=True, garbage=garbage)
 
     last_err = None
     for attempt in range(retries):
@@ -611,28 +664,50 @@ def safe_save_pdf(doc, out_path, retries=5):
         raise last_err if last_err else RuntimeError("无法保存 PDF")
 
 
+def _pix_to_pil(pix):
+    try:
+        n = pix.n
+        w, h_ = pix.width, pix.height
+        if n == 3:
+            return Image.frombytes("RGB", (w, h_), pix.samples)
+        if n == 4:
+            return Image.frombytes("RGBA", (w, h_), pix.samples).convert("RGB")
+        if n == 1:
+            return Image.frombytes("L", (w, h_), pix.samples).convert("RGB")
+    except Exception:
+        pass
+    return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+
+
 def img_to_base64_dataurl(path):
     try:
         st = os.stat(path)
         key = (path, st.st_mtime_ns, st.st_size)
-    except Exception:
-        key = (path, 0, 0)
+    except Exception as e:
+        print(f"[preview] stat failed: {path} ({e})")
+        return None
+
     cached = _DATAURL_CACHE.get(key)
-    if cached:
+    if cached is not None:
+        _DATAURL_CACHE.move_to_end(key)
         return cached
+
     try:
         with open(path, "rb") as f:
             data = f.read()
+        if not data:
+            print(f"[preview] empty file: {path}")
+            return None
         b64 = base64.b64encode(data).decode("ascii")
         low = path.lower()
         mime = "image/png" if low.endswith(".png") else "image/jpeg"
         url = f"data:{mime};base64,{b64}"
-        if len(_DATAURL_CACHE) > 200:
-            for k in list(_DATAURL_CACHE.keys())[:100]:
-                _DATAURL_CACHE.pop(k, None)
         _DATAURL_CACHE[key] = url
+        while len(_DATAURL_CACHE) > _DATAURL_CACHE_MAX:
+            _DATAURL_CACHE.popitem(last=False)
         return url
-    except Exception:
+    except Exception as e:
+        print(f"[preview] base64 failed: {path} ({e})")
         return None
 
 
@@ -652,42 +727,62 @@ def build_preview_html(preview_imgs, preview_html=None):
 
     if not preview_imgs:
         return '''
-        <div style="padding:30px 20px;color:#888;text-align:center;font-size:13.5px;
-                    background:#faf8f2;border:1px dashed #ddd5c0;border-radius:10px;
-                    line-height:1.8">
-            📄 暂无预览<br>
-            <span style="font-size:12px;color:#aaa">翻译启动后会显示前 5 页的左右对照</span>
+        <div style="padding:60px 24px;color:#8b8578;text-align:center;font-size:13.5px;
+                    background:#fdfcf9;border:1.5px dashed #ebe5d8;border-radius:16px;
+                    line-height:1.9">
+            <div style="font-size:36px;margin-bottom:12px;opacity:.4">📄</div>
+            <div style="color:#5a5a5a;font-weight:500">暂无预览</div>
+            <div style="font-size:12px;color:#a9a49a;margin-top:6px">
+                翻译启动后会显示前 5 页的左右对照
+            </div>
         </div>
         '''
 
     imgs_html = []
+    failed = []
     for p in preview_imgs:
         data_url = img_to_base64_dataurl(p)
         if not data_url:
+            failed.append(os.path.basename(p))
             continue
         imgs_html.append(
             f'<img src="{data_url}" '
-            f'style="width:100%;display:block;margin:0 0 14px 0;'
-            f'box-shadow:0 2px 10px rgba(0,0,0,.18);border-radius:4px;">'
+            f'style="width:100%;display:block;margin:0 0 16px 0;'
+            f'box-shadow:0 4px 16px rgba(15,61,62,.12);border-radius:8px;">'
         )
 
     if not imgs_html:
-        return '''
-        <div style="padding:30px 20px;color:#888;text-align:center;font-size:13.5px;
-                    background:#faf8f2;border:1px dashed #ddd5c0;border-radius:10px">
-            ⚠️ 预览图片加载失败
+        failed_str = "、".join(failed[:6]) if failed else "(未知)"
+        return f'''
+        <div style="padding:40px 24px;color:#a33;text-align:center;font-size:13.5px;
+                    background:#fdf4f4;border:1px dashed #e0c0c0;border-radius:16px">
+            <div style="font-size:32px;margin-bottom:10px">⚠️</div>
+            <div>预览图片加载失败</div>
+            <div style="font-size:12px;color:#b88;margin-top:8px">
+                失败文件：{escape(failed_str)}
+            </div>
         </div>
         '''
 
+    extra = ""
+    if failed:
+        extra = (
+            f'<div style="color:#c33;font-size:11px;text-align:center;padding:6px 0">'
+            f'（{len(failed)} 张未能加载：{escape("、".join(failed[:3]))}）</div>'
+        )
+
     return f'''
-    <div style="background:#2b2b2b;border-radius:10px;padding:14px;
-                max-height:820px;overflow-y:auto;scroll-behavior:smooth">
-      <div style="color:#aaa;font-size:12px;text-align:center;
-                  padding:6px 0 12px 0;letter-spacing:.5px">
-        左右对照 · 上下滚动阅读（{len(imgs_html)} 页）
+    <div style="background:#0f1f1f;border-radius:16px;padding:18px;
+                max-height:820px;overflow-y:auto;scroll-behavior:smooth;
+                box-shadow:inset 0 0 40px rgba(0,0,0,.3)">
+      <div style="color:#c9a961;font-size:12px;text-align:center;
+                  padding:6px 0 14px 0;letter-spacing:1px;
+                  font-weight:500;text-transform:uppercase">
+        · 左右对照 · {len(imgs_html)} 页 ·
       </div>
       {''.join(imgs_html)}
-      <div style="color:#666;font-size:11px;text-align:center;padding:6px 0">
+      {extra}
+      <div style="color:#6b6b6b;font-size:11px;text-align:center;padding:6px 0">
         — 仅显示前 {len(imgs_html)} 页 —
       </div>
     </div>
@@ -700,23 +795,28 @@ def _build_docx_preview_html(pairs):
     rows = []
     for idx, (src, dst) in enumerate(pairs):
         rows.append(f'''
-        <div style="background:#fff;border-radius:8px;padding:16px 18px;margin-bottom:12px;
-                    box-shadow:0 2px 10px rgba(0,0,0,.15)">
-          <div style="font-size:11px;color:#b09b63;font-weight:600;
-                      letter-spacing:.5px;margin-bottom:6px">第 {idx+1} 段 · 原文</div>
-          <div style="font-size:14px;color:#555;line-height:1.75;margin-bottom:14px">{escape(str(src or ""))}</div>
-          <div style="font-size:11px;color:#b09b63;font-weight:600;
-                      letter-spacing:.5px;margin-bottom:6px">第 {idx+1} 段 · 译文</div>
-          <div style="font-size:14.5px;color:#111;line-height:1.9">{escape(str(dst or ""))}</div>
+        <div style="background:#fff;border-radius:12px;padding:20px 22px;margin-bottom:12px;
+                    box-shadow:0 2px 12px rgba(15,61,62,.08);
+                    border-left:3px solid #c9a961">
+          <div style="font-size:11px;color:#c9a961;font-weight:700;
+                      letter-spacing:1px;margin-bottom:8px;text-transform:uppercase">
+            第 {idx+1} 段 · 原文
+          </div>
+          <div style="font-size:14px;color:#5a5a5a;line-height:1.8;margin-bottom:16px">{escape(str(src or ""))}</div>
+          <div style="font-size:11px;color:#c9a961;font-weight:700;
+                      letter-spacing:1px;margin-bottom:8px;text-transform:uppercase">
+            第 {idx+1} 段 · 译文
+          </div>
+          <div style="font-size:14.5px;color:#0f3d3e;line-height:1.9">{escape(str(dst or ""))}</div>
         </div>''')
     return (
-        '<div style="background:#f5f1e6;border-radius:10px;padding:14px;'
+        '<div style="background:#f5f3ee;border-radius:16px;padding:16px;'
         'max-height:820px;overflow-y:auto;scroll-behavior:smooth">'
-        '<div style="color:#888;font-size:12px;text-align:center;'
-        'padding:6px 0 12px 0;letter-spacing:.5px">'
+        '<div style="color:#8b8578;font-size:12px;text-align:center;'
+        'padding:6px 0 14px 0;letter-spacing:.5px">'
         f'文本对照预览（前 {len(pairs)} 段）</div>'
         + "".join(rows) +
-        '<div style="color:#aaa;font-size:11px;text-align:center;padding:6px 0">'
+        '<div style="color:#a9a49a;font-size:11px;text-align:center;padding:6px 0">'
         '— 完整结果请下载 Word 查看 —</div></div>'
     )
 
@@ -727,87 +827,273 @@ def _build_pptx_preview_html(pairs):
     rows = []
     for idx, (page_no, src, dst) in enumerate(pairs):
         rows.append(f'''
-        <div style="background:#fff;border-radius:8px;padding:16px 18px;margin-bottom:12px;
-                    box-shadow:0 2px 10px rgba(0,0,0,.15)">
-          <div style="font-size:11px;color:#b09b63;font-weight:600;
-                      letter-spacing:.5px;margin-bottom:6px">第 {page_no} 张 · 原文</div>
-          <div style="font-size:14px;color:#555;line-height:1.75;margin-bottom:14px">{escape(str(src or ""))}</div>
-          <div style="font-size:11px;color:#b09b63;font-weight:600;
-                      letter-spacing:.5px;margin-bottom:6px">第 {page_no} 张 · 译文</div>
-          <div style="font-size:14.5px;color:#111;line-height:1.9">{escape(str(dst or ""))}</div>
+        <div style="background:#fff;border-radius:12px;padding:20px 22px;margin-bottom:12px;
+                    box-shadow:0 2px 12px rgba(15,61,62,.08);
+                    border-left:3px solid #c9a961">
+          <div style="font-size:11px;color:#c9a961;font-weight:700;
+                      letter-spacing:1px;margin-bottom:8px;text-transform:uppercase">
+            第 {page_no} 张 · 原文
+          </div>
+          <div style="font-size:14px;color:#5a5a5a;line-height:1.8;margin-bottom:16px">{escape(str(src or ""))}</div>
+          <div style="font-size:11px;color:#c9a961;font-weight:700;
+                      letter-spacing:1px;margin-bottom:8px;text-transform:uppercase">
+            第 {page_no} 张 · 译文
+          </div>
+          <div style="font-size:14.5px;color:#0f3d3e;line-height:1.9">{escape(str(dst or ""))}</div>
         </div>''')
     return (
-        '<div style="background:#f5f1e6;border-radius:10px;padding:14px;'
+        '<div style="background:#f5f3ee;border-radius:16px;padding:16px;'
         'max-height:820px;overflow-y:auto;scroll-behavior:smooth">'
-        '<div style="color:#888;font-size:12px;text-align:center;'
-        'padding:6px 0 12px 0;letter-spacing:.5px">'
+        '<div style="color:#8b8578;font-size:12px;text-align:center;'
+        'padding:6px 0 14px 0;letter-spacing:.5px">'
         f'文本对照预览（前 {len(pairs)} 段）</div>'
         + "".join(rows) +
-        '<div style="color:#aaa;font-size:11px;text-align:center;padding:6px 0">'
+        '<div style="color:#a9a49a;font-size:11px;text-align:center;padding:6px 0">'
         '— 完整结果请下载 PPT 查看 —</div></div>'
     )
 
 
-def make_progress_html(done, total, label=""):
+# ★ 优化：新增 warning 参数（Office 半成品红条）
+def make_progress_html(done, total, label="",
+                       current_size=0, estimated_size=0, warning=""):
     if total <= 0:
         total = 1
     done = max(0, min(done, total))
     pct = int(done * 100 / total)
+
+    size_line = ""
+    if estimated_size > 0 or current_size > 0:
+        cur_s = fmt_size(current_size) if current_size else "0 B"
+        est_s = fmt_size(estimated_size) if estimated_size else "—"
+        size_line = f'''
+        <div style="display:flex;justify-content:space-between;
+                    margin-top:10px;font-size:11.5px;color:#8b8578;
+                    font-family:'SF Mono',Consolas,monospace">
+          <span>💾 已落盘 {cur_s}</span>
+          <span>预估总产出 ≈ {est_s}</span>
+        </div>
+        '''
+
+    warning_html = ""
+    if warning:
+        warning_html = f'''
+        <div style="margin-top:12px;padding:9px 13px;
+                    background:#fdf1e0;border-left:3px solid #d99a2b;
+                    border-radius:6px;font-size:12.5px;color:#8b5a1f;
+                    line-height:1.65">
+          ⚠️ {escape(warning)}
+        </div>
+        '''
+
     return f'''
-    <div style="padding:10px 4px">
-      <div style="display:flex;justify-content:space-between;font-size:13px;color:#444;margin-bottom:6px">
-        <span>{label}</span>
-        <span><b>{done}</b> / {total}（{pct}%）</span>
+    <div style="padding:6px 2px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;
+                  font-size:13px;color:#5a5a5a;margin-bottom:10px;gap:10px">
+        <span style="font-weight:500;color:#0f3d3e;
+                     overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+          {escape(label or "等待开始")}
+        </span>
+        <span style="font-family:'SF Mono',Consolas,monospace;font-size:12.5px;
+                     color:#0f3d3e;font-weight:600;flex-shrink:0">
+          {done} / {total}
+        </span>
       </div>
-      <div style="height:16px;background:#e5e7eb;border-radius:8px;overflow:hidden;box-shadow:inset 0 1px 3px rgba(0,0,0,.08)">
-        <div style="height:100%;width:{pct}%;background:linear-gradient(90deg,#4f46e5,#7c3aed);transition:width .35s ease"></div>
+      <div style="height:8px;background:#ebe5d8;border-radius:999px;overflow:hidden;
+                  position:relative">
+        <div style="height:100%;width:{pct}%;
+                    background:linear-gradient(90deg,#0f3d3e,#1f5b5c 45%,#c9a961);
+                    border-radius:999px;
+                    transition:width .45s cubic-bezier(.4,0,.2,1);
+                    box-shadow:0 0 12px rgba(201,169,97,.45);
+                    position:relative"></div>
       </div>
+      <div style="text-align:right;font-size:11px;color:#a9a49a;
+                  font-family:'SF Mono',Consolas,monospace;margin-top:4px">
+        {pct}%
+      </div>
+      {size_line}
+      {warning_html}
     </div>
     '''
 
 
-def make_done_banner(task):
+def build_done_modal_html(task):
     if task is None or task.status != "done":
         return ""
 
-    files_lines = ""
-    for f in task.output_files:
+    files_html = ""
+    for f in list(task.output_files or []):
         if f and os.path.exists(f):
             name = os.path.basename(f)
             try:
-                size_mb = os.path.getsize(f) / 1024 / 1024
-                size_str = f"<span style='color:#4a7a52'>({size_mb:.1f} MB)</span>"
+                sz = os.path.getsize(f)
+                if sz < 1024 * 100:
+                    size_str = f"{sz / 1024:.1f} KB"
+                else:
+                    size_str = f"{sz / 1024 / 1024:.2f} MB"
             except Exception:
                 size_str = ""
-            files_lines += (
-                f'<div style="margin:2px 0 0 18px">'
-                f'📄 <b>{escape(name)}</b> {size_str}</div>'
-            )
+            low = name.lower()
+            if low.endswith(".pdf"):
+                icon = "📕"
+            elif low.endswith(".docx"):
+                icon = "📘"
+            elif low.endswith(".pptx"):
+                icon = "📊"
+            elif low.endswith(".csv"):
+                icon = "📊"
+            elif low.endswith(".md"):
+                icon = "📝"
+            elif low.endswith(".html"):
+                icon = "🌐"
+            else:
+                icon = "📄"
+            files_html += f'''
+            <div style="display:flex;align-items:center;gap:12px;
+                        padding:11px 14px;background:#f9f7f1;
+                        border-radius:10px;margin-bottom:8px">
+              <span style="font-size:18px;flex-shrink:0">{icon}</span>
+              <span style="flex:1;font-size:13px;color:#1f2937;
+                           overflow:hidden;text-overflow:ellipsis;
+                           white-space:nowrap">{escape(name)}</span>
+              <span style="font-size:11.5px;color:#8b8578;
+                           font-family:'SF Mono',Consolas,monospace;
+                           flex-shrink:0">{size_str}</span>
+            </div>'''
+
+    if not files_html:
+        files_html = (
+            '<div style="padding:14px;color:#8b8578;font-size:13px;'
+            'text-align:center">（暂无输出文件）</div>'
+        )
 
     lang_label = LANG_NAMES.get(getattr(task, "target_lang", "zh-CN"), "简体中文")
+    actual_size = task.current_size
+    if not actual_size and task.output_files:
+        try:
+            actual_size = _task_disk_size(task)
+        except Exception:
+            actual_size = 0
+    est_size = task.estimated_size or 0
+
+    size_pill = ""
+    if actual_size > 0:
+        if est_size > 0:
+            diff_pct = (actual_size - est_size) / est_size * 100
+            if abs(diff_pct) < 15:
+                color = "#0f3d3e"
+                bg = "#e8f0ef"
+            else:
+                color = "#8b5a1f"
+                bg = "#fdf1e0"
+            size_pill = (
+                f'<span style="font-size:12px;color:{color};background:{bg};'
+                f'padding:5px 14px;border-radius:999px;font-weight:500">'
+                f'📦 {fmt_size(actual_size)}</span>'
+            )
+        else:
+            size_pill = (
+                f'<span style="font-size:12px;color:#0f3d3e;background:#e8f0ef;'
+                f'padding:5px 14px;border-radius:999px;font-weight:500">'
+                f'📦 {fmt_size(actual_size)}</span>'
+            )
 
     return f'''
-    <div style="background:linear-gradient(135deg,#d4edda,#c3e6cb);
-                border:2px solid #28a745;border-radius:14px;
-                padding:20px 26px;margin:14px 0;
-                box-shadow:0 4px 16px rgba(40,167,69,.25)">
-      <div style="font-size:23px;font-weight:700;color:#155724;margin-bottom:12px;
-                  font-family:'Noto Serif SC',Georgia,serif;
-                  display:flex;align-items:center;gap:10px">
-        <span>🎉 翻译完成！</span>
-      </div>
-      <div style="font-size:14px;color:#155724;line-height:2">
-        <div style="margin-bottom:4px">📖 源文件：<b>{escape(task.src_name)}</b></div>
-        <div style="margin-bottom:4px">🌐 目标语言：<b>{lang_label}</b></div>
-        <div style="margin-bottom:4px">✅ 翻译页数：<b>{task.total}</b> 页</div>
-        <div style="margin-bottom:4px">💾 结果文件（{len(task.output_files)} 个）：</div>
-        {files_lines}
-        <div style="margin-top:12px;padding-top:12px;border-top:1px dashed #28a745">
-          📁 保存位置：<br>
-          <code style="background:#fff;padding:4px 10px;border-radius:4px;
-                       font-size:12.5px;color:#155724;display:inline-block;margin-top:4px;
-                       word-break:break-all">{escape(task.out_dir)}</code>
+    <div id="done_modal_overlay"
+         onclick="if(event.target===this){{this.style.display='none'}}"
+         style="position:fixed;inset:0;background:rgba(10,20,20,.55);
+                backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+                z-index:99999;display:flex;align-items:center;
+                justify-content:center;padding:24px;
+                animation:doneFadeIn .25s ease">
+      <style>
+        @keyframes doneFadeIn {{
+          from {{opacity:0}}
+          to {{opacity:1}}
+        }}
+        @keyframes donePopIn {{
+          from {{opacity:0;transform:scale(.92) translateY(10px)}}
+          to {{opacity:1;transform:scale(1) translateY(0)}}
+        }}
+        #done_modal_card {{
+          animation:donePopIn .35s cubic-bezier(.2,1.2,.4,1);
+        }}
+        #done_modal_close_btn:hover {{
+          transform:translateY(-1px);
+          box-shadow:0 6px 20px rgba(15,61,62,.4) !important;
+        }}
+        #done_modal_close_btn:active {{
+          transform:translateY(0);
+        }}
+      </style>
+      <div id="done_modal_card"
+           style="background:#fff;max-width:540px;width:100%;
+                  border-radius:24px;padding:36px 32px 28px;
+                  box-shadow:0 24px 72px rgba(0,0,0,.4);
+                  position:relative;max-height:90vh;overflow-y:auto">
+        <div style="text-align:center;margin-bottom:24px">
+          <div style="width:76px;height:76px;border-radius:50%;
+                      background:linear-gradient(135deg,#0f3d3e,#1f5b5c);
+                      display:inline-flex;align-items:center;justify-content:center;
+                      font-size:38px;margin-bottom:16px;
+                      box-shadow:0 8px 28px rgba(15,61,62,.35);
+                      position:relative">
+            🎉
+            <div style="position:absolute;inset:-4px;border-radius:50%;
+                        border:2px solid #c9a961;opacity:.4"></div>
+          </div>
+          <div style="font-size:25px;font-weight:700;color:#0f3d3e;
+                      font-family:'Noto Serif SC',Georgia,serif;
+                      margin-bottom:8px;letter-spacing:.5px">
+            翻译完成
+          </div>
+          <div style="font-size:13.5px;color:#8b8578;
+                      overflow:hidden;text-overflow:ellipsis;
+                      white-space:nowrap;padding:0 20px">
+            {escape(task.src_name)}
+          </div>
         </div>
+
+        <div style="display:flex;gap:8px;margin-bottom:22px;
+                    justify-content:center;flex-wrap:wrap">
+          <span style="font-size:12px;color:#0f3d3e;background:#e8f0ef;
+                       padding:5px 14px;border-radius:999px;font-weight:500">
+            🌐 {lang_label}
+          </span>
+          <span style="font-size:12px;color:#0f3d3e;background:#e8f0ef;
+                       padding:5px 14px;border-radius:999px;font-weight:500">
+            ✅ {task.total} 页
+          </span>
+          <span style="font-size:12px;color:#0f3d3e;background:#e8f0ef;
+                       padding:5px 14px;border-radius:999px;font-weight:500">
+            💾 {len(task.output_files)} 个文件
+          </span>
+          {size_pill}
+        </div>
+
+        <div style="max-height:240px;overflow-y:auto;margin-bottom:18px;
+                    padding-right:2px">
+          {files_html}
+        </div>
+
+        <div style="font-size:11.5px;color:#8b8578;background:#f9f7f1;
+                    padding:10px 14px;border-radius:10px;margin-bottom:20px;
+                    word-break:break-all;line-height:1.6;
+                    font-family:'SF Mono',Consolas,monospace">
+          📁 {escape(task.out_dir)}
+        </div>
+
+        <button id="done_modal_close_btn"
+                onclick="document.getElementById('done_modal_overlay').style.display='none';event.stopPropagation();"
+                style="width:100%;padding:15px;
+                       background:linear-gradient(135deg,#0f3d3e,#1f5b5c);
+                       color:#fff;border:none;border-radius:12px;font-size:15px;
+                       font-weight:600;cursor:pointer;
+                       box-shadow:0 4px 14px rgba(15,61,62,.3);
+                       transition:transform .12s,box-shadow .18s;
+                       font-family:inherit;letter-spacing:.5px">
+          知道了
+        </button>
       </div>
     </div>
     '''
@@ -821,11 +1107,11 @@ def parse_marked(text, n):
         idx = text.rfind(NB.TERM_MARK)
         if idx >= 0:
             text = text[:idx]
-    pat = re.compile(r'\[\[B(\d+)\]\]')
-    matches = list(pat.finditer(text))
+    # ★ 优化：用模块级预编译正则
+    matches = list(_MARK_RE.finditer(text))
     for i, m in enumerate(matches):
         idx = int(m.group(1))
-        if idx in result:      # 重复标记只取第一次
+        if idx in result:
             continue
         start = m.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
@@ -836,6 +1122,25 @@ def parse_marked(text, n):
 # ============================================================
 # 内容校验
 # ============================================================
+
+def _has_target_chars(text, target_lang):
+    if not text:
+        return False
+    if target_lang in ("zh-CN", "zh-TW"):
+        return any('\u4e00' <= c <= '\u9fff' for c in text)
+    elif target_lang == "ja":
+        return any(
+            ('\u3040' <= c <= '\u30ff') or ('\u4e00' <= c <= '\u9fff')
+            for c in text
+        )
+    elif target_lang == "ko":
+        return any('\uac00' <= c <= '\ud7a3' for c in text)
+    elif target_lang == "ru":
+        return any('\u0400' <= c <= '\u04ff' for c in text)
+    elif target_lang == "ar":
+        return any('\u0600' <= c <= '\u06ff' for c in text)
+    return True
+
 
 def page_is_translated(page, target_lang="zh-CN", src_page=None):
     if target_lang not in NON_LATIN_SCRIPT_LANGS:
@@ -848,7 +1153,6 @@ def page_is_translated(page, target_lang="zh-CN", src_page=None):
     if not text or not text.strip():
         return False
 
-    # [B-5] 无 src_page 时保守返回 True，避免中文原书被误判为「已翻译」
     if src_page is None:
         return True
 
@@ -870,7 +1174,7 @@ def page_is_translated(page, target_lang="zh-CN", src_page=None):
         for c in text:
             if '\u3040' <= c <= '\u30ff':
                 cnt_kana += 1
-        if cnt_kana >= max(5, PAGE_CN_THRESHOLD // 3):
+        if cnt_kana >= max(3, PAGE_CN_THRESHOLD // 4):
             return True
         rng = ('\u4e00', '\u9fff')
     elif target_lang == "ko":
@@ -888,7 +1192,8 @@ def page_is_translated(page, target_lang="zh-CN", src_page=None):
         if lo <= c <= hi:
             cnt += 1
 
-    if cnt < PAGE_CN_THRESHOLD:
+    need_chars = max(3, min(PAGE_CN_THRESHOLD, total_nonspace // 3))
+    if cnt < need_chars:
         return False
     return (cnt / total_nonspace) >= PAGE_CN_RATIO
 
@@ -902,8 +1207,12 @@ def translations_look_valid(translations, blocks, target_lang="zh-CN"):
         src = (b[4] or "").strip()
         if not v:
             continue
-        if v.lower() != src.lower():
-            valid += 1
+        if v.lower() == src.lower():
+            continue
+        if target_lang in NON_LATIN_SCRIPT_LANGS:
+            if not _has_target_chars(v, target_lang) and len(v) > 5:
+                continue
+        valid += 1
     need = max(1, int(len(blocks) * VALID_RATIO_THRESHOLD))
     return valid >= need
 
@@ -926,7 +1235,6 @@ def _extract_status(err):
 
 
 def _is_fatal_api_error(msg):
-    """余额不足 / Key 无效等致命错误：直接抛，不要重试。"""
     if not msg:
         return False
     m = str(msg)
@@ -939,7 +1247,6 @@ def _is_fatal_api_error(msg):
 
 
 def _interruptible_sleep(seconds, stop_event):
-    """[B-10] 返回 True 表示被停止信号中断。[F9] 剩余<=0 时不再多睡一次。"""
     if stop_event is None:
         time.sleep(seconds)
         return False
@@ -1067,7 +1374,7 @@ def apply_translations(page, blocks, translations,
         items.append((rect, text))
 
     if not items:
-        return
+        return 0, 0
 
     for rect, _ in items:
         try:
@@ -1089,6 +1396,8 @@ def apply_translations(page, blocks, translations,
 
     fontname = _pdf_font_setup(page, font_path)
     align = 2 if target_lang in RTL_LANGS else 0
+    written = 0
+    failed = 0
 
     for rect, text in items:
         fs = find_fontsize(rect, text, max_font_size)
@@ -1123,7 +1432,12 @@ def apply_translations(page, blocks, translations,
                     color=(0, 0, 0), overlay=True,
                 )
             except Exception:
-                pass
+                failed += 1
+                continue
+
+        written += len(text)
+
+    return written, failed
 
 
 def translate_page(client, model, blocks, cache, cache_file,
@@ -1166,30 +1480,60 @@ def translate_page(client, model, blocks, cache, cache_file,
 
     missing = [i for i in range(len(blocks))
                if i not in parsed or not parsed[i].strip()]
-    for i in missing:
-        if stop_event is not None and stop_event.is_set():
-            break
-        bk = f"bk_{pref}" + h(cleaned[i])
-        if bk in cache and isinstance(cache[bk], str) and cache[bk].strip():
-            parsed[i] = cache[bk]
-            continue
-        r = call_api(client, model, f"[[B0]] {cleaned[i]}",
-                     target_lang, stop_event=stop_event,
-                     reader_profile=reader_profile, want_terms=False)
-        if HAS_NOTES and NB is not None:
-            body2, _ = NB.split_translation_and_terms(r)
-        else:
-            body2 = r
-        sub = parse_marked(body2, 1)
-        parsed[i] = sub.get(0, "").strip()
-        cache[bk] = parsed[i]
+
+    if missing and not (stop_event is not None and stop_event.is_set()):
+        try:
+            missing_texts = [cleaned[i] for i in missing]
+            batch_marked = "\n\n".join(
+                f"[[B{j}]] {t}" for j, t in enumerate(missing_texts)
+            )
+            r = call_api(client, model, batch_marked, target_lang,
+                         stop_event=stop_event,
+                         reader_profile=reader_profile, want_terms=False)
+            if HAS_NOTES and NB is not None:
+                body2, _ = NB.split_translation_and_terms(r)
+            else:
+                body2 = r
+            sub = parse_marked(body2, len(missing))
+            for j, i in enumerate(missing):
+                v = (sub.get(j) or "").strip()
+                if v:
+                    parsed[i] = v
+        except Exception:
+            pass
+
+        still_missing = [i for i in missing
+                         if not (parsed.get(i) or "").strip()]
+        for i in still_missing:
+            if stop_event is not None and stop_event.is_set():
+                break
+            bk = f"bk_{pref}" + h(cleaned[i])
+            if bk in cache and isinstance(cache[bk], str) and cache[bk].strip():
+                parsed[i] = cache[bk]
+                continue
+            try:
+                r = call_api(client, model, f"[[B0]] {cleaned[i]}",
+                             target_lang, stop_event=stop_event,
+                             reader_profile=reader_profile, want_terms=False)
+                if HAS_NOTES and NB is not None:
+                    body2, _ = NB.split_translation_and_terms(r)
+                else:
+                    body2 = r
+                sub = parse_marked(body2, 1)
+                parsed[i] = (sub.get(0) or "").strip()
+            except Exception:
+                parsed[i] = ""
+            cache[bk] = parsed[i]
+            save_json_file(cache_file, cache)
+
+    # ★ 优化：翻译结果无效时不写缓存，避免下次续传命中坏结果
+    if translations_look_valid(parsed, blocks, target_lang):
+        cache[key] = {
+            "paragraphs": {str(k): v for k, v in parsed.items()},
+            "terms": terms,
+        }
         save_json_file(cache_file, cache)
 
-    cache[key] = {
-        "paragraphs": {str(k): v for k, v in parsed.items()},
-        "terms": terms,
-    }
-    save_json_file(cache_file, cache)
     return parsed, terms
 
 
@@ -1204,25 +1548,28 @@ def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
         with open(trans_path, "rb") as f:
             data = f.read()
         trans = fitz.open(stream=data, filetype="pdf")
-    except Exception:
+    except Exception as e:
+        print(f"[preview] open trans failed: {e}")
         return []
 
     try:
         orig = fitz.open(task.src_path)
-    except Exception:
+    except Exception as e:
+        print(f"[preview] open src failed: {e}")
         trans.close()
         return []
 
     n = min(n_preview, len(orig), len(trans))
     preview_imgs = []
+    zoom_mat = fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM)
     for i in range(n):
         if task.stop_event.is_set():
             break
         try:
-            o_pix = orig[i].get_pixmap(matrix=fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM))
-            t_pix = trans[i].get_pixmap(matrix=fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM))
-            o = Image.open(io.BytesIO(o_pix.tobytes("png"))).convert("RGB")
-            t = Image.open(io.BytesIO(t_pix.tobytes("png"))).convert("RGB")
+            o_pix = orig[i].get_pixmap(matrix=zoom_mat)
+            t_pix = trans[i].get_pixmap(matrix=zoom_mat)
+            o = _pix_to_pil(o_pix)
+            t = _pix_to_pil(t_pix)
             hh = max(o.height, t.height)
             if o.height != hh:
                 o = o.resize((int(o.width * hh / o.height), hh), Image.LANCZOS)
@@ -1241,14 +1588,16 @@ def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
             p = os.path.join(paths["preview_dir"], f"compare_{i:04d}.jpg")
             canvas.save(p, "JPEG", quality=PREVIEW_JPEG_QUALITY, optimize=True)
             preview_imgs.append(p)
-        except Exception:
+        except Exception as e:
+            print(f"[preview] page {i} render failed: {e}")
             continue
     orig.close()
     trans.close()
     return preview_imgs
 
 
-def make_bilingual_pdf(trans_path, paths, task, n_pages=None):
+def make_bilingual_pdf(trans_path, paths, task,
+                       n_pages=None, done_pages=None):
     if not os.path.exists(trans_path):
         task.log_msg(f"⚠️ 双语 PDF 源不存在：{trans_path}")
         return
@@ -1262,56 +1611,70 @@ def make_bilingual_pdf(trans_path, paths, task, n_pages=None):
 
     try:
         orig = fitz.open(task.src_path)
-        orig_len = len(orig)
-        trans_len = len(trans)
-        total = min(orig_len, trans_len)
-        n = total if n_pages is None else min(n_pages, total)
+        total = min(len(orig), len(trans))
 
-        if n <= 0:
-            task.log_msg(f"⚠️ 双语 PDF 无有效页（orig={orig_len}, trans={trans_len}）")
+        if done_pages:
+            pages = sorted(p for p in done_pages if 1 <= p <= total)
+        else:
+            cap = total if n_pages is None else min(n_pages, total)
+            pages = list(range(1, cap + 1))
+
+        if not pages:
+            task.log_msg("⚠️ 双语 PDF 无有效页")
             orig.close()
             trans.close()
             return
 
         out_doc = fitz.open()
         done_count = 0
-        for i in range(n):
+        n_total = len(pages)
+        zoom_mat = fitz.Matrix(BILINGUAL_ZOOM, BILINGUAL_ZOOM)
+
+        for idx, pno in enumerate(pages):
             if task.stop_event.is_set():
-                task.log_msg(f"⏸ 双语 PDF 生成时收到停止信号，已生成 {done_count} 页")
+                task.log_msg(
+                    f"⏸ 双语 PDF 生成时收到停止信号，已生成 {done_count} 页")
                 break
+            i = pno - 1
             try:
-                o_pix = orig[i].get_pixmap(matrix=fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM))
-                t_pix = trans[i].get_pixmap(matrix=fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM))
-                o = Image.open(io.BytesIO(o_pix.tobytes("png"))).convert("RGB")
-                t = Image.open(io.BytesIO(t_pix.tobytes("png"))).convert("RGB")
+                o_pix = orig[i].get_pixmap(matrix=zoom_mat)
+                t_pix = trans[i].get_pixmap(matrix=zoom_mat)
+                o = _pix_to_pil(o_pix)
+                t = _pix_to_pil(t_pix)
+
                 hh = max(o.height, t.height)
                 if o.height != hh:
-                    o = o.resize((int(o.width * hh / o.height), hh), Image.LANCZOS)
+                    o = o.resize((int(o.width * hh / o.height), hh),
+                                 Image.LANCZOS)
                 if t.height != hh:
-                    t = t.resize((int(t.width * hh / t.height), hh), Image.LANCZOS)
+                    t = t.resize((int(t.width * hh / t.height), hh),
+                                 Image.LANCZOS)
+
                 gap = 10
-                canvas = Image.new("RGB", (o.width + gap + t.width, hh), (255, 255, 255))
+                canvas = Image.new(
+                    "RGB", (o.width + gap + t.width, hh), (255, 255, 255))
                 canvas.paste(o, (0, 0))
                 canvas.paste(t, (o.width + gap, 0))
 
                 buf = io.BytesIO()
-                canvas.save(buf, "JPEG", quality=PREVIEW_JPEG_QUALITY, optimize=True)
+                canvas.save(buf, "JPEG",
+                            quality=BILINGUAL_JPEG_QUALITY, optimize=False)
                 img_bytes = buf.getvalue()
                 buf.close()
 
-                w, page_h = canvas.size
-                page = out_doc.new_page(width=w, height=page_h)
-                page.insert_image(fitz.Rect(0, 0, w, page_h), stream=img_bytes)
+                w, ph = canvas.size
+                page = out_doc.new_page(width=w, height=ph)
+                page.insert_image(fitz.Rect(0, 0, w, ph), stream=img_bytes)
 
                 canvas.close()
                 o.close()
                 t.close()
                 done_count += 1
 
-                if done_count % 50 == 0:
-                    task.log_msg(f"📐 双语 PDF 生成中……{done_count}/{n} 页")
+                if done_count % 10 == 0 or done_count == n_total:
+                    task.log_msg(f"📐 双语 PDF {done_count}/{n_total} 页")
             except Exception as e:
-                task.log_msg(f"⚠️ 双语 PDF 第 {i+1} 页失败：{e}")
+                task.log_msg(f"⚠️ 双语 PDF 第 {pno} 页失败：{e}")
                 continue
 
         orig.close()
@@ -1319,7 +1682,6 @@ def make_bilingual_pdf(trans_path, paths, task, n_pages=None):
 
         if done_count > 0:
             try:
-                # [F1] 接收实际落盘路径
                 saved = safe_save_pdf(out_doc, paths["bilingual_pdf"])
                 if saved != paths["bilingual_pdf"]:
                     task.log_msg(
@@ -1333,7 +1695,7 @@ def make_bilingual_pdf(trans_path, paths, task, n_pages=None):
             except Exception as e:
                 task.log_msg(f"⚠️ 双语 PDF 保存失败：{e}")
         else:
-            task.log_msg(f"⚠️ 双语 PDF 生成 0 页")
+            task.log_msg("⚠️ 双语 PDF 生成 0 页")
         out_doc.close()
     except Exception as e:
         import traceback
@@ -1342,7 +1704,7 @@ def make_bilingual_pdf(trans_path, paths, task, n_pages=None):
 
 
 # ============================================================
-# 术语页 PDF（插到正文前）
+# 术语页 PDF
 # ============================================================
 
 def build_notes_pdf(global_terms, book_title, reader_profile="",
@@ -1464,7 +1826,6 @@ def build_notes_pdf(global_terms, book_title, reader_profile="",
 def insert_notes_into_pdf(pdf_path, global_terms, book_title,
                           reader_profile="", total_pages=0, lang_label="",
                           font_path=None, position="front"):
-    """[F3] 全函数 try/finally，os.replace 加重试。"""
     if not pdf_path or not os.path.exists(pdf_path):
         return False
     if not global_terms or not global_terms.get("terms"):
@@ -1604,7 +1965,6 @@ def _pptx_set_para_text(para, new_text):
 
 
 def _iter_pptx_shapes(shapes):
-    """[F11] 递归展开 group shape 内的文本框。"""
     for shape in shapes:
         if MSO_SHAPE_TYPE is not None and \
                 getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
@@ -1618,15 +1978,9 @@ def _iter_pptx_shapes(shapes):
 
 def translate_batch_office(client, model, texts, cache, cache_file,
                            target_lang="zh-CN", stop_event=None, task=None):
-    """
-    [B-1][B-2] 返回 (results, fail_count)。
-    - 逐条重试时非致命错误只跳过当前段，不 break。
-    - fail_count 在函数末尾统一统计一次，避免双计。
-    [F13] 用独立 failed set 记录失败下标。
-    """
     pref = cache_prefix(target_lang)
     results = [None] * len(texts)
-    failed = set()                # [F13] 独立记录失败下标
+    failed = set()
     any_success = False
 
     def ckey(t):
@@ -1659,7 +2013,6 @@ def translate_batch_office(client, model, texts, cache, cache_file,
                 else:
                     failed.add(gi)
         except RuntimeError as e:
-            # 致命错误（余额 / Key）直接向上抛，交给 worker 标 error
             if _is_fatal_api_error(str(e)):
                 raise
             if task:
@@ -1683,13 +2036,11 @@ def translate_batch_office(client, model, texts, cache, cache_file,
 
         save_json_file(cache_file, cache)
 
-    # 有段落要翻，但一个字都没翻成功 → 视为致命失败
     if pending and not any_success and not (
         stop_event is not None and stop_event.is_set()
     ):
         raise RuntimeError("所有段落翻译均失败，请检查 API Key / 余额 / 网络")
 
-    # [B-2][F13] 在函数末尾统一统计失败数，并回填原文
     fail_count = 0
     for i in range(len(results)):
         if results[i] is None:
@@ -1733,6 +2084,25 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
     task.log_msg(f"📏 正文字号上限：{max_font_size}pt")
     if target_lang in RTL_LANGS:
         task.log_msg(f"↔️ 目标语言为 RTL，使用右对齐")
+
+    try:
+        with fitz.open(task.src_path) as _tmp_doc:
+            total_src_pages = len(_tmp_doc)
+    except Exception:
+        total_src_pages = 0
+    est = estimate_output_size(
+        "pdf", task.src_path, total_src_pages,
+        target_lang=target_lang, want_terms=enable_terms,
+    )
+    task.estimated_size = est.get("total", 0)
+    if task.estimated_size:
+        task.log_msg(
+            f"📦 预估总产出 ≈ {fmt_size(task.estimated_size)}"
+            f"（译文 ≈ {fmt_size(est.get('main', 0))} · "
+            f"双语 ≈ {fmt_size(est.get('bilingual', 0))} · "
+            f"笔记 ≈ {fmt_size(est.get('notes', 0))}）"
+        )
+    save_state(task, force=True)
 
     pdf_exists = os.path.exists(paths["output_pdf"])
     if done_pages and pdf_exists:
@@ -1793,7 +2163,8 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
     task.status = "running"
     task.total = limit
     task.label = f"PDF · 目标前 {limit} 页"
-    task.current = len([p for p in done_pages if p <= limit])
+    # ★ 优化：计数器一次算好，后续 O(1) 递增
+    task.current = sum(1 for p in done_pages if p <= limit)
     task.log_msg(f"✅ PDF 共 {total} 页，本次目标 {limit} 页，已翻 {task.current} 页")
     save_state(task, force=True)
 
@@ -1801,19 +2172,17 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
         try:
             task.preview_images = render_preview_only(paths["output_pdf"], paths, task)
             _add_output(task, paths["output_pdf"])
+            refresh_task_size(task, force=True)
             save_state(task, force=True)
         except Exception as e:
             task.log_msg(f"⚠️ 初始预览生成失败：{e}")
 
-    # 打开一份原始 PDF，用于翻译后校验和失败回滚
     orig_doc_for_check = None
     try:
         orig_doc_for_check = fitz.open(task.src_path)
     except Exception as e:
-        # [F12] 打开失败要写日志
         task.log_msg(f"⚠️ 无法打开原 PDF 用于校验/回滚：{e}（本次运行跳过回滚保护）")
 
-    newly = []
     error_msg = None
     all_pages_ok = True
 
@@ -1834,7 +2203,8 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
         if not blocks:
             done_pages.add(page_num)
             save_progress_file(paths["progress_file"], done_pages)
-            task.current = len([p for p in done_pages if p <= limit])
+            if page_num <= limit:
+                task.current += 1
             task.label = f"已跳过插图页 {page_num}"
             save_state(task)
             continue
@@ -1852,10 +2222,16 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
                 all_pages_ok = False
                 continue
 
-            apply_translations(page, blocks, trans,
-                               font_path=font_path,
-                               max_font_size=max_font_size,
-                               target_lang=target_lang)
+            written, failed = apply_translations(
+                page, blocks, trans,
+                font_path=font_path,
+                max_font_size=max_font_size,
+                target_lang=target_lang,
+            )
+            if failed:
+                task.log_msg(
+                    f"⚠️ 第 {page_num} 页有 {failed}/{len(blocks)} 段写入失败（内容可能丢失）"
+                )
 
             if target_lang in NON_LATIN_SCRIPT_LANGS:
                 src_check_page = None
@@ -1865,11 +2241,40 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
 
                 if not page_is_translated(page, target_lang,
                                           src_page=src_check_page):
+                    try:
+                        after_text = page.get_text() or ""
+                    except Exception:
+                        after_text = ""
+                    total_ns = sum(1 for c in after_text if not c.isspace())
+                    if target_lang in ("zh-CN", "zh-TW"):
+                        cnt_target = sum(
+                            1 for c in after_text if '\u4e00' <= c <= '\u9fff')
+                    elif target_lang == "ja":
+                        cnt_target = sum(
+                            1 for c in after_text
+                            if '\u3040' <= c <= '\u30ff')
+                    elif target_lang == "ko":
+                        cnt_target = sum(
+                            1 for c in after_text if '\uac00' <= c <= '\ud7a3')
+                    elif target_lang == "ru":
+                        cnt_target = sum(
+                            1 for c in after_text if '\u0400' <= c <= '\u04ff')
+                    elif target_lang == "ar":
+                        cnt_target = sum(
+                            1 for c in after_text if '\u0600' <= c <= '\u06ff')
+                    else:
+                        cnt_target = 0
+                    ratio = (cnt_target / total_ns) if total_ns else 0.0
+                    n_translated = sum(
+                        1 for v in trans.values() if (v or "").strip())
                     task.log_msg(
-                        f"⚠️ 第 {page_num} 页写入后未检出目标语言字符，回滚该页"
+                        f"⚠️ 第 {page_num} 页写入后未检出目标语言字符 "
+                        f"(块={len(blocks)}, 译段={n_translated}, "
+                        f"目标字符={cnt_target}, 非空白={total_ns}, "
+                        f"占比={ratio:.1%}, "
+                        f"阈值需≥{PAGE_CN_THRESHOLD}且≥{PAGE_CN_RATIO:.0%})，"
+                        f"回滚该页"
                     )
-                    # [F2] 用 insert_pdf + delete_page(pno+1) 替换原页，
-                    #      避免末页 delete→insert 的边界问题
                     if (orig_doc_for_check is not None
                             and pno < len(orig_doc_for_check)):
                         try:
@@ -1907,17 +2312,16 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
 
         done_pages.add(page_num)
         save_progress_file(paths["progress_file"], done_pages)
-        newly.append(page_num)
-        task.current = len([p for p in done_pages if p <= limit])
+        if page_num <= limit:
+            task.current += 1
         task.label = f"已翻 {task.current}/{limit} 页"
-        task.log_msg(f"✅ 第 {page_num} 页完成（本次新增 {len(newly)} 页）")
-        save_state(task, force=True)
+        task.log_msg(f"✅ 第 {page_num} 页完成")
+        save_state(task, force=(page_num % 5 == 0))
 
         should_save = (page_num <= PREVIEW_PAGES) or (page_num % CHECKPOINT_EVERY == 0)
         if should_save:
             try:
-                # [F1] 接收实际路径，若被占用回退到 .bak.pdf 则同步 paths
-                saved = safe_save_pdf(doc, paths["output_pdf"])
+                saved = safe_save_pdf(doc, paths["output_pdf"], garbage=1)
                 if saved != paths["output_pdf"]:
                     task.log_msg(
                         f"⚠️ 原文件被占用，已保存到备用路径："
@@ -1929,12 +2333,14 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
                     task.preview_images = render_preview_only(
                         paths["output_pdf"], paths, task)
                 _add_output(task, paths["output_pdf"])
+                refresh_task_size(task, force=True)
                 save_state(task, force=True)
             except Exception as e:
                 task.log_msg(f"⚠️ 落盘失败：{e}")
 
+    save_failed = False
     try:
-        saved = safe_save_pdf(doc, paths["output_pdf"])
+        saved = safe_save_pdf(doc, paths["output_pdf"], garbage=3)
         if saved != paths["output_pdf"]:
             task.log_msg(
                 f"⚠️ 原文件被占用，已保存到备用路径："
@@ -1942,6 +2348,7 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
             )
             paths["output_pdf"] = saved
     except Exception as e:
+        save_failed = True
         error_msg = error_msg or f"保存译文 PDF 失败：{e}"
     finally:
         try:
@@ -1953,6 +2360,15 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
                 orig_doc_for_check.close()
         except Exception:
             pass
+
+    if save_failed or not os.path.exists(paths["output_pdf"]):
+        task.status = "error"
+        task.error = error_msg or "译文 PDF 保存失败，无法继续生成双语 / 笔记"
+        task.label = "出错（保存失败）"
+        task.log_msg(f"❌ {task.error}")
+        refresh_task_size(task, force=True)
+        save_state(task, force=True)
+        return
 
     target_pages = set(range(1, limit + 1))
     done_in_target = target_pages & done_pages
@@ -1976,9 +2392,17 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
         return
 
     try:
-        task.log_msg(f"🖼 生成左右对照双语 PDF（{len(done_pages)} 页，请稍候）……")
-        make_bilingual_pdf(paths["output_pdf"], paths, task, n_pages=None)
-        _add_output(task, paths["output_pdf"], paths["bilingual_pdf"])
+        dp = {p for p in done_pages if p <= limit}
+        if not dp:
+            task.log_msg("ℹ️ 无已翻译页，跳过双语 PDF 生成")
+        else:
+            task.log_msg(
+                f"🖼 生成左右对照双语 PDF（{len(dp)} 页，请稍候）……")
+            make_bilingual_pdf(
+                paths["output_pdf"], paths, task,
+                n_pages=None, done_pages=dp,
+            )
+            _add_output(task, paths["output_pdf"], paths["bilingual_pdf"])
     except Exception as e:
         task.log_msg(f"⚠️ 收尾生成双语 PDF 失败：{e}")
 
@@ -2002,11 +2426,19 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
             with open(notes_md, "w", encoding="utf-8") as f:
                 f.write(md)
 
-            html = NB.build_notes_html(
-                book_title, global_terms,
-                reader_profile=reader_profile,
-                total_pages=limit, lang_label=lang_label,
-            )
+            try:
+                html = NB.build_notes_html(
+                    book_title, global_terms,
+                    reader_profile=reader_profile,
+                    total_pages=limit, lang_label=lang_label,
+                    pdf_rel_path="../translated.pdf",
+                )
+            except TypeError:
+                html = NB.build_notes_html(
+                    book_title, global_terms,
+                    reader_profile=reader_profile,
+                    total_pages=limit, lang_label=lang_label,
+                )
             with open(notes_html, "w", encoding="utf-8") as f:
                 f.write(html)
 
@@ -2078,12 +2510,19 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
     else:
         task.status = "paused"
         task.label = "半成品（部分页未成功）"
+    refresh_task_size(task, force=True)
     save_state(task, force=True)
 
 
 def docx_worker(task, paths, real_key, model, target_lang="zh-CN"):
     client = OpenAI(api_key=real_key, base_url="https://api.deepseek.com")
     cache = load_json_file(paths["cache_file"], {})
+
+    est = estimate_output_size("docx", task.src_path, 0,
+                               target_lang=target_lang, want_terms=False)
+    task.estimated_size = est.get("total", 0)
+    if task.estimated_size:
+        task.log_msg(f"📦 预估总产出 ≈ {fmt_size(task.estimated_size)}")
 
     try:
         wdoc = Document(task.src_path)
@@ -2106,7 +2545,6 @@ def docx_worker(task, paths, real_key, model, target_lang="zh-CN"):
     for table in wdoc.tables:
         for row in table.rows:
             for cell in row.cells:
-                # [F10] lxml 元素身份稳定，直接用 cell._tc 入 set
                 if cell._tc in seen:
                     continue
                 seen.add(cell._tc)
@@ -2208,12 +2646,19 @@ def docx_worker(task, paths, real_key, model, target_lang="zh-CN"):
         task.status = "done"
         task.label = "全部完成"
         task.log_msg(f"🎉 Word 翻译完成！共 {total_targets} 段")
+    refresh_task_size(task, force=True)
     save_state(task, force=True)
 
 
 def pptx_worker(task, paths, real_key, model, target_lang="zh-CN"):
     client = OpenAI(api_key=real_key, base_url="https://api.deepseek.com")
     cache = load_json_file(paths["cache_file"], {})
+
+    est = estimate_output_size("pptx", task.src_path, 0,
+                               target_lang=target_lang, want_terms=False)
+    task.estimated_size = est.get("total", 0)
+    if task.estimated_size:
+        task.log_msg(f"📦 预估总产出 ≈ {fmt_size(task.estimated_size)}")
 
     try:
         prs = Presentation(task.src_path)
@@ -2231,9 +2676,8 @@ def pptx_worker(task, paths, real_key, model, target_lang="zh-CN"):
     targets = []
     texts = []
     for si, slide in enumerate(prs.slides):
-        # [F11] 递归 group shape
         for shape in _iter_pptx_shapes(slide.shapes):
-            if not shape.has_text_frame:
+            if not getattr(shape, "has_text_frame", False):
                 continue
             for para in shape.text_frame.paragraphs:
                 text = "".join(r.text for r in para.runs)
@@ -2297,6 +2741,7 @@ def pptx_worker(task, paths, real_key, model, target_lang="zh-CN"):
         task.status = "done"
         task.label = "全部完成"
         task.log_msg(f"🎉 PPT 翻译完成！共 {total_targets} 段")
+    refresh_task_size(task, force=True)
     save_state(task, force=True)
 
 
@@ -2519,21 +2964,27 @@ def on_load_preview():
     if current is None:
         return build_preview_html([]), []
 
-    imgs = list(current.preview_images or [])
+    imgs = [p for p in (current.preview_images or [])
+            if p and os.path.exists(p)]
     ph = getattr(current, "preview_html", "") or ""
-    files = [os.path.abspath(f) for f in current.output_files
+    files = [os.path.abspath(f) for f in (current.output_files or [])
              if f and os.path.exists(f)]
     return build_preview_html(imgs, ph), files
 
 
 def build_task_list_html(tasks):
     if not tasks:
-        return '<div style="padding:14px;color:#888;font-size:13px">暂无任务</div>'
+        return ('<div style="padding:18px;color:#a9a49a;font-size:13px;'
+                'text-align:center">暂无任务</div>')
 
     status_icon = {"queued": "⏳", "running": "▶️", "stopping": "⏸️",
                    "paused": "🛑", "done": "✅", "error": "❌"}
-    status_color = {"queued": "#888", "running": "#0a7d32", "stopping": "#b8860b",
-                    "paused": "#b8860b", "done": "#0a7d32", "error": "#c0392b"}
+    status_color = {"queued": "#8b8578", "running": "#0f3d3e",
+                    "stopping": "#b8860b", "paused": "#b8860b",
+                    "done": "#0f3d3e", "error": "#c0392b"}
+    status_bg = {"queued": "#f0ebe0", "running": "#e8f0ef",
+                 "stopping": "#fdf1e0", "paused": "#fdf1e0",
+                 "done": "#e8f0ef", "error": "#fbeaea"}
     status_text = {"queued": "排队中", "running": "运行中", "stopping": "停止中…",
                    "paused": "已暂停", "done": "已完成", "error": "出错"}
     kind_icon = {"pdf": "📕", "docx": "📘", "pptx": "📊"}
@@ -2542,22 +2993,41 @@ def build_task_list_html(tasks):
     for t in tasks[:8]:
         ic = status_icon.get(t.status, "•")
         col = status_color.get(t.status, "#666")
+        bg = status_bg.get(t.status, "#f0ebe0")
         stx = status_text.get(t.status, t.status)
         kc = kind_icon.get(t.kind, "📄")
         pct = int(t.current * 100 / t.total) if t.total else 0
         lang_short = LANG_NAMES.get(getattr(t, "target_lang", "zh-CN"), "")
+        size_hint = ""
+        if t.current_size or t.estimated_size:
+            size_hint = (
+                f'<span style="font-size:11px;color:#8b8578;'
+                f'font-family:\'SF Mono\',Consolas,monospace">'
+                f'{fmt_size(t.current_size) if t.current_size else "0 B"}'
+                f' / {fmt_size(t.estimated_size) if t.estimated_size else "—"}'
+                f'</span>'
+            )
         rows.append(f'''
-        <div style="padding:10px 14px;border-bottom:1px solid #eee;display:flex;align-items:center;gap:10px;font-size:13.5px">
-          <span style="font-size:16px">{ic}</span>
-          <span style="font-size:16px">{kc}</span>
-          <span style="font-family:Consolas,monospace;color:#666">#{t.task_id}</span>
-          <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{escape(t.src_name)}</span>
-          <span style="font-size:12px;color:#888;background:#f5f1e6;padding:2px 8px;border-radius:10px">{lang_short}</span>
-          <span style="color:{col};font-weight:600">{stx}</span>
-          <span style="color:#666">{t.current}/{t.total} ({pct}%)</span>
+        <div style="padding:11px 14px;border-bottom:1px solid #f2ede0;
+                    display:flex;align-items:center;gap:10px;font-size:13px">
+          <span style="font-size:15px;flex-shrink:0">{kc}</span>
+          <span style="font-family:'SF Mono',Consolas,monospace;
+                       color:#8b8578;font-size:11.5px;flex-shrink:0">#{t.task_id}</span>
+          <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+                       white-space:nowrap;color:#1a1a1a"
+                title="{escape(t.src_name)}">{escape(t.src_name)}</span>
+          {size_hint}
+          <span style="font-size:11.5px;color:#8b8578;background:#f5f1e6;
+                       padding:2px 8px;border-radius:999px;flex-shrink:0">{lang_short}</span>
+          <span style="color:{col};background:{bg};font-weight:600;
+                       font-size:11.5px;padding:2px 10px;border-radius:999px;
+                       flex-shrink:0">{stx}</span>
+          <span style="color:#8b8578;font-family:'SF Mono',Consolas,monospace;
+                       font-size:11.5px;flex-shrink:0">{t.current}/{t.total} ({pct}%)</span>
         </div>''')
 
-    return f'<div style="background:#fff;border:1px solid #e6dfce;border-radius:10px;overflow:hidden">{"".join(rows)}</div>'
+    return (f'<div style="background:#fff;border:1px solid #ebe5d8;'
+            f'border-radius:14px;overflow:hidden">{"".join(rows)}</div>')
 
 
 def on_refresh_fast(stop_dd_value=None):
@@ -2575,16 +3045,28 @@ def on_refresh_fast(stop_dd_value=None):
         previews = []
         preview_html = ""
     else:
-        banner = make_done_banner(current)
-        progress_html = banner + make_progress_html(current.current, current.total, current.label)
-        # [F5] log_msg 原地修剪，切片在 GIL 下是安全的
+        try:
+            refresh_task_size(current)
+        except Exception:
+            pass
+        # ★ 优化：Office 半成品时给进度条传 warning
+        warning = ""
+        if current.status == "paused" and current.error:
+            warning = current.error
+        progress_html = make_progress_html(
+            current.current, current.total, current.label,
+            current_size=current.current_size,
+            estimated_size=current.estimated_size,
+            warning=warning,
+        )
         log_text = "\n".join(current.log[-40:])
-        previews = list(current.preview_images or [])
+        previews = [p for p in (current.preview_images or [])
+                    if p and os.path.exists(p)]
         preview_html = getattr(current, "preview_html", "") or ""
 
     if current is not None:
         if preview_html:
-            sig = ("html", hash(preview_html))
+            sig = ("html", hashlib.md5(preview_html.encode("utf-8")).hexdigest())
         else:
             sig = preview_signature(previews)
 
@@ -2594,9 +3076,9 @@ def on_refresh_fast(stop_dd_value=None):
             _PREVIEW_HTML_CACHE[current.task_id] = html
             gallery_value = html
         else:
-            gallery_value = _PREVIEW_HTML_CACHE.get(
-                current.task_id, build_preview_html([])
-            )
+            gallery_value = _PREVIEW_HTML_CACHE.get(current.task_id)
+            if gallery_value is None:
+                gallery_value = build_preview_html([])
     else:
         gallery_value = build_preview_html([])
 
@@ -2618,7 +3100,18 @@ def on_refresh_fast(stop_dd_value=None):
             _LAST_PREVIEW_SIG.pop(k, None)
             _PREVIEW_HTML_CACHE.pop(k, None)
 
-    return task_list_html, progress_html, log_text, dd_update, gallery_value
+    modal_html = ""
+    for t in tasks:
+        if t.status == "done":
+            if not t.current_size:
+                try:
+                    refresh_task_size(t, force=True)
+                except Exception:
+                    pass
+            modal_html = build_done_modal_html(t)
+            break
+
+    return task_list_html, progress_html, log_text, dd_update, gallery_value, modal_html
 
 
 def open_result_folder():
@@ -2651,7 +3144,6 @@ def open_result_folder():
 # ============================================================
 
 def _shutdown():
-    """[F8] 最多等 2s 轮询 running()，不再 sleep(0.8) 硬阻塞。"""
     try:
         running = MANAGER.running()
         if not running:
@@ -2660,11 +3152,10 @@ def _shutdown():
             t.stop_event.set()
             t.log_msg("🛑 程序退出，正在停止…")
             save_state(t, force=True)
-        # 最多等 2 秒让 worker 收尾
-        for _ in range(20):
+        for _ in range(75):
             if not MANAGER.running():
                 break
-            time.sleep(0.1)
+            time.sleep(0.2)
     except Exception:
         pass
 
@@ -2694,111 +3185,123 @@ with gr.Blocks(
         font=[gr.themes.GoogleFont("Noto Sans SC"), "system-ui", "sans-serif"],
     ),
     css="""
-    /* ===== 基础色板 ===== */
     body, .gradio-container {
         background: #faf8f2 !important;
         color: #1a1a1a !important;
         font-size: 15px !important;
     }
     .gradio-container {
-        max-width: 1360px !important;
+        max-width: 1380px !important;
         margin: 0 auto !important;
-        padding: 12px 28px 40px !important;
+        padding: 14px 28px 44px !important;
     }
-
-    /* ===== 头部卡片（精简） ===== */
     .card-head {
         background: linear-gradient(135deg, #f7f3e8 0%, #f0ebdc 100%);
         border: 1px solid #e2dccb;
-        border-radius: 14px;
-        padding: 24px 30px 22px;
-        margin-bottom: 16px;
+        border-radius: 18px;
+        padding: 28px 32px 24px;
+        margin-bottom: 18px;
         position: relative; overflow: hidden;
-        box-shadow: 0 2px 8px rgba(0,0,0,.04);
+        box-shadow: 0 3px 14px rgba(15,61,62,.06);
+        text-align: center;
     }
     .card-head::before {
         content: ""; position: absolute; top: 0; left: 0; right: 0;
-        height: 3px; background: linear-gradient(90deg, #2b2b2b, #b09b63, #2b2b2b);
+        height: 3px;
+        background: linear-gradient(90deg, #0f3d3e, #c9a961, #0f3d3e);
     }
     .card-head h1 {
-        font-size: 26px; font-weight: 700; color: #111; margin: 0;
+        font-size: 27px; font-weight: 700; color: #0f3d3e; margin: 0;
         font-family: "Noto Serif SC", Georgia, serif;
-        letter-spacing: .5px;
+        letter-spacing: .6px;
     }
     .card-head .sub {
-        color: #555; font-size: 14px; margin-top: 10px; line-height: 1.9;
+        color: #5a5a5a; font-size: 13.5px; margin-top: 12px;
+        line-height: 1.9;
+        display: flex; justify-content: center; flex-wrap: wrap;
+        gap: 4px 0;
     }
-    .card-head .sub .dot { color: #b09b63; margin: 0 10px; }
+    .card-head .sub .dot { color: #c9a961; margin: 0 10px; }
 
-    /* ===== 分组标题 ===== */
     .section-title {
-        font-size: 15.5px; font-weight: 600; color: #2b2b2b;
-        padding: 2px 0 10px 0;
-        border-bottom: 1px solid #ece5d4;
-        margin-bottom: 14px;
+        font-size: 14.5px; font-weight: 600; color: #0f3d3e;
+        padding: 0 0 12px 0;
+        border-bottom: 1px solid #ebe5d8;
+        margin-bottom: 16px;
         font-family: "Noto Serif SC", Georgia, serif;
-        letter-spacing: .3px;
-        display: flex; align-items: center; gap: 6px;
+        letter-spacing: .4px;
+        display: flex; align-items: center; gap: 8px;
     }
 
-    /* ===== 左右两栏卡片 ===== */
+    #main_row {
+        gap: 18px !important;
+        align-items: stretch !important;
+    }
+    #main_row > .gr-column,
+    #main_row > div {
+        flex: 1 1 0 !important;
+        min-width: 0 !important;
+    }
     #setup_col, #status_col {
         background: #ffffff !important;
-        border: 1px solid #e6dfce !important;
-        border-radius: 14px !important;
-        padding: 20px 22px !important;
-        box-shadow: 0 2px 10px rgba(0,0,0,.04);
-        align-self: flex-start;
+        border: 1px solid #ebe5d8 !important;
+        border-radius: 18px !important;
+        padding: 22px 24px !important;
+        box-shadow: 0 3px 14px rgba(15,61,62,.05);
+        display: flex !important;
+        flex-direction: column !important;
+        min-height: 720px;
     }
     #status_col { background: #fdfcf8 !important; }
 
     @media (max-width: 960px) {
-        #setup_col, #status_col {
-            min-width: 100% !important;
-        }
+        #main_row > .gr-column,
+        #main_row > div { min-width: 100% !important; }
+        #setup_col, #status_col { min-height: auto; }
     }
 
-    /* ===== 表单通用 ===== */
     label span, .gr-box > label > span {
         color: #1a1a1a !important;
-        font-size: 14px !important;
+        font-size: 13.5px !important;
         font-weight: 500 !important;
     }
     .gradio-container input:not([type="checkbox"]):not([type="radio"]),
     .gradio-container textarea,
     .gradio-container select {
         background: #ffffff !important; color: #111 !important;
-        border: 1px solid #d8d2c0 !important; font-size: 14.5px !important;
+        border: 1px solid #e2dccb !important; font-size: 14px !important;
+        border-radius: 9px !important;
+    }
+    .gradio-container input:focus,
+    .gradio-container textarea:focus {
+        border-color: #c9a961 !important;
+        box-shadow: 0 0 0 3px rgba(201,169,97,.15) !important;
     }
     .gradio-container .block {
         background: transparent !important;
         border: none !important;
     }
-    /* 让卡片内的小组件不重复加边框 */
-    #setup_col .block,
-    #status_col .block {
+    #setup_col .block, #status_col .block {
         border: none !important;
         box-shadow: none !important;
     }
 
-    /* ===== 文档类型 Radio 横排 ===== */
-    #file_mode { padding: 6px 0 !important; }
+    #file_mode { padding: 4px 0 !important; }
     #file_mode .wrap, #file_mode > div > div {
         display: flex !important; flex-direction: row !important;
-        gap: 22px !important; flex-wrap: wrap !important;
+        gap: 20px !important; flex-wrap: wrap !important;
     }
     #file_mode label {
-        font-size: 14.5px !important; font-weight: 500 !important;
+        font-size: 14px !important; font-weight: 500 !important;
         cursor: pointer !important;
     }
     #file_mode input[type="radio"] {
         -webkit-appearance: radio !important; appearance: radio !important;
-        width: 17px !important; height: 17px !important;
-        min-width: 17px !important; max-width: 17px !important;
-        accent-color: #2b2b2b !important; margin-right: 7px !important;
+        width: 16px !important; height: 16px !important;
+        min-width: 16px !important; max-width: 16px !important;
+        accent-color: #0f3d3e !important; margin-right: 7px !important;
     }
 
-    /* ===== 复选框 ===== */
     #trial_cb, #terms_cb {
         background: transparent !important; border: none !important;
         padding: 4px 2px !important;
@@ -2806,158 +3309,185 @@ with gr.Blocks(
     #trial_cb *, #terms_cb * { cursor: pointer !important; }
     #trial_cb input[type="checkbox"], #terms_cb input[type="checkbox"] {
         -webkit-appearance: checkbox !important; appearance: checkbox !important;
-        width: 17px !important; height: 17px !important;
-        min-width: 17px !important; max-width: 17px !important;
-        accent-color: #2b2b2b !important; margin-right: 9px !important;
+        width: 16px !important; height: 16px !important;
+        min-width: 16px !important; max-width: 16px !important;
+        accent-color: #0f3d3e !important; margin-right: 9px !important;
     }
     #trial_cb label, #terms_cb label {
-        cursor: pointer !important; font-size: 14px !important;
+        cursor: pointer !important; font-size: 13.5px !important;
     }
 
-    /* ===== 文件上传区 ===== */
     #pdf_upload {
-        min-height: 110px !important;
-        max-height: 180px !important;
+        min-height: 100px !important;
+        max-height: 170px !important;
         overflow-y: auto !important;
         box-sizing: border-box !important;
-        border: 1.5px dashed #d8d2c0 !important;
-        border-radius: 10px !important;
+        border: 1.5px dashed #e2dccb !important;
+        border-radius: 12px !important;
         background: #fdfcf8 !important;
         transition: border-color .2s, background .2s;
     }
     #pdf_upload:hover {
-        border-color: #b09b63 !important;
+        border-color: #c9a961 !important;
         background: #faf8f2 !important;
     }
     #pdf_upload > div { padding: 10px 14px !important; }
     #pdf_upload button {
-        padding: 7px 18px !important; font-size: 13.5px !important;
-        min-height: 36px !important; cursor: pointer !important;
-        background: #f0ebdc !important; border: 1px solid #ddd5c0 !important;
-        color: #222 !important; border-radius: 7px !important;
+        padding: 7px 18px !important; font-size: 13px !important;
+        min-height: 34px !important; cursor: pointer !important;
+        background: #f5f1e6 !important; border: 1px solid #e2dccb !important;
+        color: #0f3d3e !important; border-radius: 8px !important;
+        font-weight: 500 !important;
     }
     #pdf_upload button:hover { background: #ebe5d5 !important; }
     #pdf_upload .file {
         padding: 7px 11px !important; margin: 5px 0 !important;
-        font-size: 13.5px !important; background: #f5f1e6 !important;
-        border-radius: 6px !important;
-        border: 1px solid #e6dfce !important;
+        font-size: 13px !important; background: #f5f1e6 !important;
+        border-radius: 8px !important;
+        border: 1px solid #ebe5d8 !important;
     }
 
-    /* ===== 操作按钮行 ===== */
-    #action_grid .gr-row, #action_grid .row {
-        display: flex !important; gap: 10px !important;
-        margin-top: 6px !important; margin-bottom: 0 !important;
+    #action_grid { margin-top: 4px; }
+    #action_grid .gr-row,
+    #action_grid .row {
+        display: grid !important;
+        grid-template-columns: 1fr 1fr !important;
+        gap: 10px !important;
+        margin: 0 !important;
     }
-    #action_grid .gr-row > *, #action_grid .row > * {
-        flex: 1 1 0 !important; min-width: 0 !important;
+    #action_grid .gr-row > *,
+    #action_grid .row > * {
+        min-width: 0 !important;
+        width: 100% !important;
     }
     #action_grid button {
-        width: 100% !important; height: 46px !important;
-        font-size: 14.5px !important; font-weight: 600 !important;
+        width: 100% !important;
+        height: 46px !important;
+        font-size: 14px !important;
+        font-weight: 600 !important;
         border-radius: 10px !important;
         letter-spacing: .3px;
         transition: transform .08s, box-shadow .15s, background .15s;
     }
     #action_grid button:hover { transform: translateY(-1px); }
     #action_grid .primary {
-        background: #2b2b2b !important; color: #faf8f2 !important;
+        background: linear-gradient(135deg, #0f3d3e, #1f5b5c) !important;
+        color: #faf8f2 !important;
         border: none !important;
-        box-shadow: 0 3px 10px rgba(0,0,0,.18);
+        box-shadow: 0 3px 12px rgba(15,61,62,.28);
     }
     #action_grid .primary:hover {
-        background: #000 !important;
-        box-shadow: 0 5px 14px rgba(0,0,0,.28);
+        background: linear-gradient(135deg, #0a2e2f, #0f3d3e) !important;
+        box-shadow: 0 5px 16px rgba(15,61,62,.38);
     }
     #action_grid .secondary {
-        background: #f5f1e6 !important; color: #2b2b2b !important;
-        border: 1px solid #ddd5c0 !important;
+        background: #f5f1e6 !important; color: #0f3d3e !important;
+        border: 1px solid #e2dccb !important;
     }
     #action_grid .secondary:hover {
         background: #ebe5d5 !important;
-        border-color: #b09b63 !important;
+        border-color: #c9a961 !important;
     }
 
-    /* ===== 单独停止行 ===== */
-    #stop_one_row { gap: 10px !important; align-items: stretch !important; }
-    #stop_dd { flex: 3 1 0 !important; min-width: 0 !important; }
+    #stop_one_row {
+        gap: 10px !important; align-items: stretch !important;
+    }
+    #stop_dd { flex: 1 1 auto !important; min-width: 0 !important; }
     #stop_one_btn {
-        flex: 1 1 0 !important; min-width: 130px !important;
+        flex: 0 0 auto !important; min-width: 128px !important;
         height: 44px !important; border-radius: 10px !important;
-        background: #8b3a3a !important; color: #fff !important;
-        border: none !important; font-size: 14.5px !important;
+        background: linear-gradient(135deg, #8b3a3a, #6b2222) !important;
+        color: #fff !important;
+        border: none !important; font-size: 14px !important;
         font-weight: 600 !important;
         transition: transform .08s, background .15s;
     }
     #stop_one_btn:hover {
-        background: #6b2222 !important;
+        background: linear-gradient(135deg, #6b2222, #4a1414) !important;
         transform: translateY(-1px);
     }
 
-    /* ===== 预览区滚动条 ===== */
+    #task_log textarea {
+        background: #0f1f1f !important;
+        border: 1px solid #1f3838 !important;
+        font-family: "SF Mono", "Consolas", "Menlo", monospace !important;
+        font-size: 12px !important;
+        line-height: 1.7 !important;
+        color: #c9a961 !important;
+        padding: 14px 16px !important;
+        resize: vertical !important;
+        min-height: 260px !important;
+        max-height: 420px !important;
+        white-space: pre !important;
+        overflow-y: auto !important;
+        border-radius: 12px !important;
+    }
+    #task_log {
+        background: transparent !important;
+        border: none !important;
+    }
+
     #preview_box::-webkit-scrollbar { width: 10px; }
     #preview_box::-webkit-scrollbar-track {
         background: #e8e1cc; border-radius: 5px;
     }
     #preview_box::-webkit-scrollbar-thumb {
-        background: #b09b63; border-radius: 5px;
+        background: #c9a961; border-radius: 5px;
     }
 
-    /* ===== Accordion / 标题 ===== */
     .gradio-container .accordion-header {
-        background: #f5f1e6 !important; color: #222 !important;
-        font-size: 14.5px !important; font-weight: 500 !important;
-        border-radius: 10px !important;
+        background: #f5f1e6 !important; color: #0f3d3e !important;
+        font-size: 14px !important; font-weight: 500 !important;
+        border-radius: 12px !important;
+        border: 1px solid #ebe5d8 !important;
     }
     .gradio-container h3 {
-        color: #111 !important; font-size: 18px !important;
+        color: #0f3d3e !important; font-size: 18px !important;
         margin-top: 20px !important;
     }
     .gradio-container .prose, .gradio-container .prose * {
         color: #1a1a1a !important;
     }
 
-    /* ===== Tabs ===== */
     .gradio-container .tab-nav {
-        border-bottom: 2px solid #ece5d4 !important;
-        margin-bottom: 10px !important;
+        border-bottom: 2px solid #ebe5d8 !important;
+        margin-bottom: 12px !important;
     }
     .gradio-container .tab-nav button {
-        font-size: 15px !important; font-weight: 600 !important;
-        color: #666 !important;
+        font-size: 14.5px !important; font-weight: 600 !important;
+        color: #8b8578 !important;
         padding: 10px 22px !important;
-        border-radius: 8px 8px 0 0 !important;
+        border-radius: 10px 10px 0 0 !important;
         transition: color .15s, background .15s;
     }
     .gradio-container .tab-nav button.selected {
-        color: #2b2b2b !important;
+        color: #0f3d3e !important;
         background: #f5f1e6 !important;
     }
     .gradio-container .tab-nav button:hover {
-        color: #2b2b2b !important;
+        color: #0f3d3e !important;
         background: #faf8f2 !important;
     }
 
-    /* ===== 打开目录提示 ===== */
     #open_hint {
         min-height: 0 !important;
-        margin-top: 2px !important;
+        margin-top: 8px !important;
     }
     #open_hint p {
-        font-size: 13px !important;
-        color: #666 !important;
+        font-size: 12.5px !important;
+        color: #0f3d3e !important;
         margin: 4px 0 0 0 !important;
-        padding: 6px 10px !important;
-        background: #faf8f2 !important;
-        border-left: 3px solid #b09b63 !important;
-        border-radius: 4px !important;
+        padding: 7px 12px !important;
+        background: #f5f1e6 !important;
+        border-left: 3px solid #c9a961 !important;
+        border-radius: 6px !important;
+        word-break: break-all;
     }
     """,
 ) as demo:
 
-    # ══════════════════════════════════════════════════════
-    # 顶部：标题卡片 + 折叠使用说明
-    # ══════════════════════════════════════════════════════
+    modal_html = gr.HTML(value="", elem_id="modal_host")
+
     gr.HTML("""
     <div class="card-head">
       <h1>📖 PDF / Word / PPT 翻译器</h1>
@@ -2972,15 +3502,15 @@ with gr.Blocks(
 
     with gr.Accordion("💡 使用说明 / 输出文件说明（点击展开）", open=False):
         gr.HTML("""
-        <div style="padding:14px 20px;font-size:14px;line-height:2;color:#444;
-                    background:#fdfcf8;border:1px solid #ece5d4;border-radius:10px">
+        <div style="padding:14px 20px;font-size:13.5px;line-height:2;color:#444;
+                    background:#fdfcf8;border:1px solid #ebe5d8;border-radius:12px">
           <div><b>🔑 密钥</b>　留空取 <code>.env</code> 中的默认值；填写 → 临时覆盖</div>
           <div><b>🌐 语言</b>　简体/繁体中文、英、日、韩、法、德、西、葡、俄、阿、意</div>
           <div><b>🔤 字体</b>　自动扫描 <code>D:\\file\\translate\\word_type</code> 目录下的字体（仅对 PDF 生效）</div>
           <div><b>📏 字号</b>　正文字号上限，实际会根据原文框自动缩小</div>
-          <div><b>📓 术语表</b>　勾选后，术语页会插在 PDF 正文前（带书签）</div>
+          <div><b>📓 术语表</b>　勾选后，术语页会插在 PDF 正文前（带书签）；notes.html 支持鼠标悬停查词 + 点击定位到原文页</div>
           <div><b>📁 输出位置</b>　译文在 <code>result/&lt;文件名&gt;/</code>，笔记在 <code>_&lt;文件名&gt;/</code></div>
-          <div style="margin-top:10px;padding-top:10px;border-top:1px dashed #d8d0bc">
+          <div style="margin-top:10px;padding-top:10px;border-top:1px dashed #e2dccb">
             <b>📚 三种成品</b>
             <div style="margin-left:16px">
               · <code>translated.pdf</code>　纯译文<br>
@@ -2991,23 +3521,16 @@ with gr.Blocks(
         </div>
         """)
 
-    # ══════════════════════════════════════════════════════
-    # 主体：左右两栏
-    #   左 = 设置 + 操作按钮
-    #   右 = 任务列表 + 单独停止 + 进度
-    # ══════════════════════════════════════════════════════
-    with gr.Row(equal_height=False):
+    with gr.Row(equal_height=False, elem_id="main_row"):
 
-        # ─────────── 左栏：翻译设置 ───────────
-        with gr.Column(scale=5, elem_id="setup_col"):
+        with gr.Column(scale=1, min_width=440, elem_id="setup_col"):
             gr.HTML('<div class="section-title">⚙️ 翻译设置</div>')
 
-            # 第一行：Key / 模型 / 语言
             with gr.Row(equal_height=True):
                 api_key = gr.Textbox(
                     label="🔑 DeepSeek API Key",
                     type="password",
-                    placeholder="留空用 .env，填入临时覆盖",
+                    placeholder="留空用 .env",
                     scale=3,
                 )
                 model = gr.Dropdown(
@@ -3017,15 +3540,14 @@ with gr.Blocks(
                     scale=2,
                     elem_id="model_dd",
                 )
-                target_lang = gr.Dropdown(
-                    choices=[(v, k) for k, v in LANG_NAMES.items()],
-                    value="zh-CN",
-                    label="🌐 目标语言",
-                    scale=2,
-                    elem_id="lang_dd",
-                )
 
-            # 文档类型 + 上传
+            target_lang = gr.Dropdown(
+                choices=[(v, k) for k, v in LANG_NAMES.items()],
+                value="zh-CN",
+                label="🌐 目标语言",
+                elem_id="lang_dd",
+            )
+
             file_mode = gr.Radio(
                 choices=["📕 PDF 书籍", "📘 Word 文档", "📊 PPT 演示"],
                 value="📕 PDF 书籍",
@@ -3038,7 +3560,6 @@ with gr.Blocks(
                 elem_id="pdf_upload",
             )
 
-            # 字体 + 字号
             _font_choices = sorted(FONTS_MAP.keys())
             with gr.Row(equal_height=True):
                 font_dd = gr.Dropdown(
@@ -3060,7 +3581,6 @@ with gr.Blocks(
                     scale=2,
                 )
 
-            # 术语 + 试翻
             with gr.Row(equal_height=True):
                 want_terms_cb = gr.Checkbox(
                     label="📓 生成术语表与阅读笔记",
@@ -3081,7 +3601,6 @@ with gr.Blocks(
                 lines=1,
             )
 
-            # 操作按钮（一行 4 个）
             with gr.Column(elem_id="action_grid"):
                 with gr.Row(equal_height=True):
                     btn = gr.Button("▶ 开始翻译", variant="primary")
@@ -3089,15 +3608,13 @@ with gr.Blocks(
                     refresh_btn = gr.Button("🔄 刷新", variant="secondary")
                     open_btn = gr.Button("📁 打开目录", variant="secondary")
 
-            # 打开目录提示（显示在按钮下方）
             open_hint = gr.Markdown(value="", elem_id="open_hint")
 
-        # ─────────── 右栏：任务 & 进度 ───────────
-        with gr.Column(scale=4, elem_id="status_col"):
+        with gr.Column(scale=1, min_width=440, elem_id="status_col"):
             gr.HTML('<div class="section-title">📋 任务列表</div>')
             task_list_html = gr.HTML(
-                value='<div style="padding:14px;color:#888;font-size:13px">'
-                      '暂无任务</div>'
+                value='<div style="padding:18px;color:#a9a49a;font-size:13px;'
+                      'text-align:center">暂无任务</div>'
             )
 
             gr.HTML('<div class="section-title" style="margin-top:18px">'
@@ -3116,17 +3633,16 @@ with gr.Blocks(
                     '📊 当前进度</div>')
             progress_bar = gr.HTML(value=make_progress_html(0, 1, "等待开始"))
 
-    # ══════════════════════════════════════════════════════
-    # 日志（折叠）
-    # ══════════════════════════════════════════════════════
-    with gr.Accordion("📋 任务日志（点击展开 / 收起）", open=False):
-        log = gr.Textbox(
-            label="", lines=14, interactive=False, show_label=False
-        )
+            gr.HTML('<div class="section-title" style="margin-top:18px">'
+                    '📋 任务日志</div>')
+            log = gr.Textbox(
+                label="",
+                lines=14,
+                interactive=False,
+                show_label=False,
+                elem_id="task_log",
+            )
 
-    # ══════════════════════════════════════════════════════
-    # 底部：Tabs（预览 / 下载）
-    # ══════════════════════════════════════════════════════
     with gr.Tabs():
         with gr.TabItem("👀 效果预览"):
             gallery = gr.HTML(
@@ -3143,12 +3659,9 @@ with gr.Blocks(
                 interactive=True, show_label=False,
             )
 
-    # ══════════════════════════════════════════════════════
-    # 事件绑定（保持与原来完全一致，只有 open_btn 输出改为 open_hint）
-    # ══════════════════════════════════════════════════════
-    fast_outputs = [task_list_html, progress_bar, log, stop_dd, gallery]
+    fast_outputs = [task_list_html, progress_bar, log, stop_dd, gallery, modal_html]
     full_outputs = [task_list_html, progress_bar, log, stop_dd,
-                    gallery, out_files, doc_file]
+                    gallery, modal_html, out_files, doc_file]
 
     btn.click(
         on_start,
@@ -3176,6 +3689,7 @@ with gr.Blocks(
 
     demo.load(on_refresh_fast, [stop_dd], fast_outputs,
               concurrency_limit=None, concurrency_id="load")
+
 
 # ============================================================
 # main
