@@ -20,6 +20,7 @@ import base64
 import hashlib
 import shutil
 import socket
+import copy
 import threading
 import uuid
 import io
@@ -55,6 +56,10 @@ try:
     from docx.oxml import OxmlElement
     from docx.text.paragraph import Paragraph
     from pptx import Presentation
+    try:
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+    except Exception:
+        MSO_SHAPE_TYPE = None
     HAS_OFFICE = True
 except ImportError:
     HAS_OFFICE = False
@@ -86,6 +91,7 @@ _MPL_LOCK = threading.Lock()
 _LAST_PREVIEW_SIG = {}
 _PREVIEW_HTML_CACHE = {}
 _MODAL_SHOWN = set()
+_SELECTED_STOP_VALUE = None
 
 # ================= 字体自动扫描 =================
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -442,23 +448,15 @@ def parse_solution_response(text, n_blocks):
         ans = _clean_tags(ans_m.group(1) if ans_m else "")
         sol = _clean_tags(sol_m.group(1) if sol_m else "")
 
-        # 兜底：模型只给了裸文本
         if not ans and not sol:
             stripped = _clean_tags(body)
             stripped = re.sub(r'\[\[B\d+\]\]', '', stripped).strip()
             if stripped:
                 sol = stripped
 
-        # 关键：只有真的非空才记录
         if ans or sol:
             result[idx] = {"ans": ans, "sol": sol}
     return result
-
-
-def solution_is_valid(res):
-    if not res:
-        return False
-    return bool((res.get("ans") or "").strip() or (res.get("sol") or "").strip())
 
 
 # ============================================================
@@ -1229,7 +1227,6 @@ def pdf_worker(task, paths, real_key, model, trial):
             task.log_msg(f"⚠️ 初始预览失败：{e}")
 
     error_msg = None
-    completed = False
 
     for pno in range(total):
         if task.stop_event.is_set():
@@ -1281,8 +1278,6 @@ def pdf_worker(task, paths, real_key, model, trial):
             save_state(task)
         except Exception as e:
             task.log_msg(f"⚠️ 落盘失败：{e}")
-    else:
-        completed = True
 
     try:
         safe_save_pdf(doc, paths["solved_pdf"])
@@ -1306,6 +1301,9 @@ def pdf_worker(task, paths, real_key, model, trial):
     except Exception:
         pass
     task.output_files = [paths["solved_pdf"]]
+
+    target_pages = set(range(1, limit + 1))
+    completed = (target_pages & done_pages == target_pages) and not error_msg
 
     if completed:
         task.status = "done"
@@ -1331,11 +1329,22 @@ def pdf_worker(task, paths, real_key, model, trial):
 # Word / PPT worker
 # ============================================================
 def _docx_insert_after(para, text):
+    """
+    在段落后面插入一个新段落。
+    复制原段落首个 run 的字体（rPr），视觉更统一。
+    """
     new_p = OxmlElement("w:p")
     para._p.addnext(new_p)
     new_para = Paragraph(new_p, para._parent)
     if text:
-        new_para.add_run(text)
+        run = new_para.add_run(text)
+        if para.runs:
+            try:
+                src_rpr = para.runs[0]._element.find(qn('w:rPr'))
+                if src_rpr is not None:
+                    run._element.insert(0, copy.deepcopy(src_rpr))
+            except Exception:
+                pass
     try:
         new_para.style = para.style
     except Exception:
@@ -1352,6 +1361,19 @@ def _docx_insert_after(para, text):
     return new_para
 
 
+def _iter_pptx_shapes(shapes):
+    """★ 修复 B：递归遍历形状（含组合形状内部的形状）"""
+    for shape in shapes:
+        if MSO_SHAPE_TYPE is not None and \
+                getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
+            try:
+                yield from _iter_pptx_shapes(shape.shapes)
+                continue
+            except Exception:
+                pass
+        yield shape
+
+
 def docx_worker(task, paths, real_key, model):
     client = OpenAI(api_key=real_key, base_url="https://api.deepseek.com")
     cache = load_json_file(paths["cache_file"], {})
@@ -1364,13 +1386,26 @@ def docx_worker(task, paths, real_key, model):
         save_state(task)
         return
 
+    # ★ 修复 A：正文段落 + 表格单元格段落一起处理
     targets = [p for p in wdoc.paragraphs if p.text.strip()]
+
+    _seen_cells = set()
+    for table in wdoc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                if id(cell._tc) in _seen_cells:
+                    continue
+                _seen_cells.add(id(cell._tc))
+                for p in cell.paragraphs:
+                    if p.text.strip():
+                        targets.append(p)
+
     total = len(targets)
     task.status = "running"
     task.total = total
     task.current = 0
     task.label = f"Word · 共 {total} 段"
-    task.log_msg(f"📘 Word 已打开，共 {total} 段")
+    task.log_msg(f"📘 Word 已打开，共 {total} 段（含表格）")
     save_state(task)
 
     error_msg = None
@@ -1407,7 +1442,6 @@ def docx_worker(task, paths, real_key, model):
             rendered = "\n".join(ins)
             _docx_insert_after(para, rendered)
             solved_count += 1
-            # ★ 收集预览
             if len(preview_pairs) < PREVIEW_PARAS:
                 preview_pairs.append((text, rendered))
                 task.preview_html = _build_docx_preview_html(preview_pairs)
@@ -1453,8 +1487,9 @@ def pptx_worker(task, paths, real_key, model):
 
     targets = []
     for si, slide in enumerate(prs.slides):
-        for shape in slide.shapes:
-            if not shape.has_text_frame:
+        # ★ 修复 B：用递归遍历，覆盖组合形状
+        for shape in _iter_pptx_shapes(slide.shapes):
+            if not getattr(shape, "has_text_frame", False):
                 continue
             for para in shape.text_frame.paragraphs:
                 txt = "".join(r.text for r in para.runs)
@@ -1466,7 +1501,7 @@ def pptx_worker(task, paths, real_key, model):
     task.total = total
     task.current = 0
     task.label = f"PPT · 共 {total} 段"
-    task.log_msg(f"📊 PPT 已打开，共 {total} 段")
+    task.log_msg(f"📊 PPT 已打开，共 {total} 段（含组合形状）")
     save_state(task)
 
     error_msg = None
@@ -1501,12 +1536,13 @@ def pptx_worker(task, paths, real_key, model):
             if sol:
                 parts.append(f"【解析】{sol}")
             rendered = "\n".join(parts)
+            # PPT 里换行用 \v
             if para.runs:
-                para.runs[0].text = text + "\n" + rendered
+                para.runs[0].text = text + "\v" + rendered
                 for r in para.runs[1:]:
                     r.text = ""
             else:
-                para.add_run(text + "\n" + rendered)
+                para.add_run(text + "\v" + rendered)
             solved_count += 1
             if len(preview_pairs) < PREVIEW_PARAS:
                 preview_pairs.append((si + 1, text, rendered))
@@ -1577,12 +1613,12 @@ def start_task(kind, upload_path, real_key, model, trial):
     return task
 
 
-def on_start(api_key, model, doc_file, trial):
+def on_start(api_key, model, doc_file, trial, stop_dd_value=None):
     global SELECTED_TASK_ID
 
     real_key = (api_key or "").strip() or DEFAULT_API_KEY
     if not real_key or not doc_file:
-        return on_refresh_fast() + ([], None)
+        return on_refresh_fast(stop_dd_value) + ([], None)
 
     model = (model or DEFAULT_MODEL).strip()
     if model not in ("deepseek-chat", "deepseek-reasoner"):
@@ -1600,14 +1636,14 @@ def on_start(api_key, model, doc_file, trial):
         if cur:
             cur.log_msg(f"❌ 不支持的文件类型：{doc_file.name}")
             save_state(cur)
-        return on_refresh_fast() + ([], None)
+        return on_refresh_fast(stop_dd_value) + ([], None)
 
     if kind in ("docx", "pptx") and not HAS_OFFICE:
         cur = MANAGER.get(SELECTED_TASK_ID) if SELECTED_TASK_ID else None
         if cur:
             cur.log_msg("❌ 未安装 python-docx / python-pptx")
             save_state(cur)
-        return on_refresh_fast() + ([], None)
+        return on_refresh_fast(stop_dd_value) + ([], None)
 
     src_name = os.path.basename(doc_file.name)
     base = os.path.splitext(src_name)[0]
@@ -1623,44 +1659,44 @@ def on_start(api_key, model, doc_file, trial):
             SELECTED_TASK_ID = existing.task_id
             existing.log_msg(f"⚠️ 已存在运行中的任务（#{existing.task_id}）")
             save_state(existing)
-            return on_refresh_fast() + ([], None)
+            return on_refresh_fast(stop_dd_value) + ([], None)
 
         try:
             start_task(kind, doc_file.name, real_key, model, trial)
         except Exception:
             pass
 
-    return on_refresh_fast() + ([], None)
+    return on_refresh_fast(stop_dd_value) + ([], None)
 
 
-def on_stop_all():
+def on_stop_all(stop_dd_value=None):
     running = MANAGER.running()
     if not running:
         current = MANAGER.get(SELECTED_TASK_ID) if SELECTED_TASK_ID else None
         if current:
             current.log_msg("⚠️ 没有正在运行的任务")
             save_state(current)
-        return on_refresh_fast()
+        return on_refresh_fast(stop_dd_value)
     for t in running:
         t.stop_event.set()
         t.status = "stopping"
         t.label = f"⏸ 停止信号已发出…（已处理 {t.current}/{t.total}）"
         t.log_msg("⏸ 收到停止信号 —— 当前一步完成后暂停")
         save_state(t)
-    return on_refresh_fast()
+    return on_refresh_fast(stop_dd_value)
 
 
-def on_stop_selected(label):
+def on_stop_selected(label, stop_dd_value=None):
     global SELECTED_TASK_ID
     if not label:
-        return on_refresh_fast()
+        return on_refresh_fast(stop_dd_value)
     m = re.match(r'#([0-9a-f]{8})', label)
     if not m:
-        return on_refresh_fast()
+        return on_refresh_fast(stop_dd_value)
     tid = m.group(1)
     t = MANAGER.get(tid)
     if t is None:
-        return on_refresh_fast()
+        return on_refresh_fast(stop_dd_value)
     if t.status in ("queued", "running"):
         t.stop_event.set()
         t.status = "stopping"
@@ -1668,7 +1704,7 @@ def on_stop_selected(label):
         t.log_msg("⏸ 收到单独停止信号")
         save_state(t)
         SELECTED_TASK_ID = tid
-    return on_refresh_fast()
+    return on_refresh_fast(stop_dd_value)
 
 
 def on_load_preview():
@@ -1752,7 +1788,8 @@ def build_task_list_html(tasks):
             f'border-radius:14px;overflow:hidden">{rows_html}</div>')
 
 
-def on_refresh_fast():
+def on_refresh_fast(stop_dd_value=None):
+    global _SELECTED_STOP_VALUE
     tasks = MANAGER.all_sorted()
     task_list_html = build_task_list_html(tasks)
 
@@ -1811,7 +1848,12 @@ def on_refresh_fast():
     for t in active:
         short = t.src_name if len(t.src_name) <= 50 else t.src_name[:47] + "..."
         choices.append(f"#{t.task_id}  {short}  [{t.status}]")
-    dd_update = gr.update(choices=choices)
+
+    preserve = stop_dd_value if stop_dd_value in choices else _SELECTED_STOP_VALUE
+    if preserve not in choices:
+        preserve = None
+    _SELECTED_STOP_VALUE = preserve
+    dd_update = gr.update(choices=choices, value=preserve)
 
     alive_ids = {t.task_id for t in tasks}
     for k in list(_LAST_PREVIEW_SIG.keys()):
@@ -1824,7 +1866,8 @@ def on_refresh_fast():
         if k not in alive_ids:
             _MODAL_SHOWN.discard(k)
 
-    modal_html = gr.update(value=None)
+    # ★ 修复 C：gr.update() 不带参数 = "不改动"，弹窗不被 tick 擦掉
+    modal_html = gr.update()
     for t in tasks:
         if t.status == "done" and t.task_id not in _MODAL_SHOWN:
             _MODAL_SHOWN.add(t.task_id)
@@ -2288,28 +2331,28 @@ with gr.Blocks(
 
     btn.click(
         on_start,
-        [api_key, model, doc_file, trial],
+        [api_key, model, doc_file, trial, stop_dd],
         full_outputs,
         concurrency_limit=3,
         concurrency_id="start",
     )
-    stop_btn.click(on_stop_all, None, fast_outputs,
+    stop_btn.click(on_stop_all, [stop_dd], fast_outputs,
                    concurrency_limit=None, concurrency_id="stop")
     stop_one_btn.click(on_stop_selected, [stop_dd], fast_outputs,
                        concurrency_limit=None, concurrency_id="stop_one")
-    refresh_btn.click(on_refresh_fast, None, fast_outputs,
+    refresh_btn.click(on_refresh_fast, [stop_dd], fast_outputs,
                       concurrency_limit=None, concurrency_id="manual")
     open_btn.click(open_result_folder, None, [log])
     load_btn.click(on_load_preview, None, [gallery, out_files])
 
     try:
         timer = gr.Timer(3.0)
-        timer.tick(on_refresh_fast, None, fast_outputs,
+        timer.tick(on_refresh_fast, [stop_dd], fast_outputs,
                    concurrency_limit=None, concurrency_id="tick")
     except Exception:
         pass
 
-    demo.load(on_refresh_fast, None, fast_outputs,
+    demo.load(on_refresh_fast, [stop_dd], fast_outputs,
               concurrency_limit=None, concurrency_id="load")
 
 
