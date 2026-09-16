@@ -62,6 +62,9 @@
 
   去哪拿 API Key？  https://platform.deepseek.com
 
+  可选：DEEPSEEK_BASE_URL（换 API 地址）、DEEPSEEK_TIMEOUT（超时秒数，默认 180）、
+  TRANSLATE_FONT_PATH（字体路径），详见 .env.example 注释。
+
 
 第 5 步：准备中文字体
 
@@ -120,7 +123,7 @@
 解题流程
 
   1. 上传作业：拖入 .pdf / .docx / .pptx
-  2. 先试解：勾选「试解模式」→ 只处理前 5 页
+  2. 先试解：勾选「试解模式」→ 只处理前 N 页（3/5/10/20 可选）
   3. 看效果：满意后取消勾选，再全量跑
 
 

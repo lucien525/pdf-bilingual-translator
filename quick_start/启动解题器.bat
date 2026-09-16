@@ -1,6 +1,7 @@
 @echo off
 chcp 65001 >nul
-cd /d %~dp0
+REM ★ 修复：bat 在 quick_start 子目录，退回项目根目录再启动 python
+cd /d "%~dp0.."
 
 echo ============================================================
 echo   PDF / Word / PPT 作业解题器 启动器

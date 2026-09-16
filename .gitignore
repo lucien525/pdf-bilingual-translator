@@ -11,6 +11,7 @@ result/
 访问网址.txt
 访问网址_解题器.txt
 font_test.pdf
+_backup_*/
 
 # ========== Python 缓存 ==========
 __pycache__/

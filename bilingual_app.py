@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-PDF / Word / PPT 翻译器
+PDF / Word / PPT 翻译器（全功能优化版）
+- 领域 Prompt 微调（通用/技术/文学/新闻/法律/医学）
+- 自定义 Prompt 追加
+- 试翻页数可选（3/5/10/20）
+- 任务列表可按状态筛选
+- 日志带时间戳
+- 端口 7860~7869，与 homework 7870~7899 完全分开
 """
 
 import sys
@@ -24,7 +30,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional
 from html import escape
-from functools import lru_cache   # ★ 优化：正则缓存
+from functools import lru_cache
 
 import pymupdf as fitz
 try:
@@ -37,7 +43,6 @@ from openai import OpenAI
 import gradio as gr
 from dotenv import load_dotenv
 
-# ★ 修复：Pillow 9.4+ 弃用 Image.LANCZOS，用兼容写法
 _RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
 
 try:
@@ -67,17 +72,30 @@ DEFAULT_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 DEFAULT_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip()
 if DEFAULT_MODEL not in ("deepseek-chat", "deepseek-reasoner"):
     DEFAULT_MODEL = "deepseek-chat"
+# ★ 修复：base_url / 超时进 .env，不再硬编码
+DEEPSEEK_BASE_URL = os.getenv(
+    "DEEPSEEK_BASE_URL", "https://api.deepseek.com"
+).rstrip("/")
+try:
+    API_TIMEOUT = float(os.getenv("DEEPSEEK_TIMEOUT", "180"))
+except Exception:
+    API_TIMEOUT = 180.0
 
 # ================= 字体扫描 =================
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+# ★ 修复：env 字体路径的目录也加入扫描根，换机器不用改代码
+_ENV_FONT = os.getenv("TRANSLATE_FONT_PATH", "").strip()
 
 FONT_ROOTS = [
     r"D:\file\translate\word_type",
     os.path.join(_HERE, "fonts"),
 ]
+if _ENV_FONT and os.path.isdir(os.path.dirname(_ENV_FONT)):
+    FONT_ROOTS.insert(0, os.path.dirname(_ENV_FONT))
 
 _DEFAULT_FONT_CANDIDATES = [
-    os.getenv("TRANSLATE_FONT_PATH", "").strip(),
+    _ENV_FONT,
     r"D:\file\translate\word_type\09_SourceHanSerifSC\OTF\SimplifiedChinese\SourceHanSerifSC-Regular.otf",
     os.path.join(_HERE, "fonts", "SourceHanSerifSC-Regular.otf"),
 ]
@@ -85,8 +103,6 @@ FONT_PATH = next((p for p in _DEFAULT_FONT_CANDIDATES
                   if p and os.path.exists(p)), "")
 
 _FONT_EXT = (".otf", ".ttf", ".ttc", ".otc")
-
-# ★ 优化：字体扫描深度从 5 提升到 8
 _FONT_SCAN_MAX_DEPTH = 8
 
 
@@ -137,7 +153,6 @@ _LANG_FONT_PATTERNS = {
 }
 
 
-# ★ 优化：正则结果 lru_cache 缓存，避免每次切换语言都重新编译
 @lru_cache(maxsize=2048)
 def _pattern_hit(name_lower, pat_lower):
     return re.search(r'(?:^|[^a-z])' + re.escape(pat_lower) + r'(?:[^a-z]|$)',
@@ -211,6 +226,80 @@ OFFICE_BATCH_SIZE = 20
 STATE_SAVE_INTERVAL = 1.5
 SIZE_REFRESH_INTERVAL = 5.0
 
+# ★ 修复：双语 PDF 每 N 页检查点落盘并重开，避免整本攒内存
+BILINGUAL_FLUSH_EVERY = 20
+
+# ★ 新增：任务列表筛选
+TASK_FILTER_CHOICES = [
+    ("全部", "all"),
+    ("运行中", "running"),
+    ("已完成", "done"),
+    ("出错", "error"),
+]
+_TASK_FILTER = "all"
+
+# ★ 新增：试翻页数可选
+TRIAL_PAGE_CHOICES = [
+    ("3 页", 3),
+    ("5 页（默认）", 5),
+    ("10 页", 10),
+    ("20 页", 20),
+]
+
+# ★ 新增：领域 Prompt 微调
+DOMAIN_CHOICES = [
+    ("通用（默认）", "general"),
+    ("技术 / 计算机", "tech"),
+    ("文学 / 小说", "literature"),
+    ("新闻 / 报道", "news"),
+    ("法律 / 合同", "law"),
+    ("医学 / 生物", "medical"),
+]
+
+_DOMAIN_PROMPTS = {
+    "general": "",
+    "tech": (
+        "\n【技术文本特别注意】\n"
+        "- 术语首次出现时可在括号内保留原文；\n"
+        "- 代码、命令、变量名保持原样不译；\n"
+        "- 准确性优先于文采。\n"
+    ),
+    "literature": (
+        "\n【文学文本特别注意】\n"
+        "- 优先保留原文节奏与韵味；\n"
+        "- 比喻、双关尽量在目标语言中找到对等表达；\n"
+        "- 对话符合人物身份，不要书面化。\n"
+    ),
+    "news": (
+        "\n【新闻文本特别注意】\n"
+        "- 保持客观中立的新闻语气；\n"
+        "- 数字、日期、机构名准确；\n"
+        "- 不要添加主观评论。\n"
+    ),
+    "law": (
+        "\n【法律文本特别注意】\n"
+        "- 术语必须精确，不要意译；\n"
+        "- 句式严格对应原文结构；\n"
+        "- 不确定的术语保留原文并加括号说明。\n"
+    ),
+    "medical": (
+        "\n【医学文本特别注意】\n"
+        "- 医学术语使用标准译名；\n"
+        "- 药物名、剂量单位必须准确；\n"
+        "- 不确定的保留原文。\n"
+    ),
+}
+
+# ★ 修复：领域角色设定（避免"文学翻译家"与"术语必须精确"自相矛盾）
+_DOMAIN_ROLES = {
+    "general": "你是一位资深文学翻译家，精通多国语言，译笔力求神似而非字对字。",
+    "literature": "你是一位资深文学翻译家，精通多国语言，译笔力求神似而非字对字。",
+    "tech": "你是一位资深技术文档翻译，术语准确、表达严谨，准确性优先于文采。",
+    "law": "你是一位资深法律翻译，术语必须精确对应，句式严格对应原文结构。",
+    "medical": "你是一位资深医学翻译，使用标准医学译名，术语必须准确。",
+    "news": "你是一位资深新闻翻译，译笔准确客观、简洁严谨。",
+}
+
 LANG_NAMES = {
     "zh-CN": "简体中文", "zh-TW": "繁体中文",
     "en": "英语", "ja": "日语", "ko": "韩语",
@@ -226,28 +315,37 @@ _MARK_RE = re.compile(r'\[\[B(\d+)\]\]')
 
 _IO_LOCK = threading.Lock()
 _CREATE_LOCK = threading.Lock()
+_REFRESH_LOCK = threading.RLock()
 _LAST_PREVIEW_SIG = {}
 _PREVIEW_HTML_CACHE = {}
 _DATAURL_CACHE = OrderedDict()
-_DATAURL_CACHE_MAX = 200
+# ★ 修复：预览 dataURL 缓存上限 200 → 40（base64 常驻内存太大）
+_DATAURL_CACHE_MAX = 40
 _SELECTED_STOP_VALUE = None
 
 _STATE_SAVE_TS = {}
-# ★ 修复：改为 RLock，避免 Ctrl+C 与正常 save 冲突时死锁
 _STATE_SAVE_LOCK = threading.RLock()
 
-# ★ 修复：弹窗只弹一次
-_MODAL_SHOWN = set()
+# ★ 修复：缓存 JSON 写节流（避免每页/每段整文件重写放大 IO）
+_JSON_DEBOUNCE_SEC = 3.0
+_JSON_PENDING = {}
+_JSON_LAST_WRITE = {}
+
+_MODAL_SHOWN = OrderedDict()
+_MODAL_SHOWN_MAX = 500
 
 
 # ============================================================
 # 提示词
 # ============================================================
 
-def build_system_prompt(target_lang, reader_profile="", want_terms=True):
+def build_system_prompt(target_lang, reader_profile="", want_terms=True,
+                        domain="general", extra_prompt=""):
     lang = LANG_NAMES.get(target_lang, "简体中文")
+    # ★ 修复：按领域选角色，不再一律"文学翻译家"
+    role = _DOMAIN_ROLES.get(domain, _DOMAIN_ROLES["general"])
     base = (
-        f"你是一位资深文学翻译家，精通多国语言，译笔力求神似而非字对字。"
+        f"{role}"
         f"请把用户发来的内容翻译成【{lang}】，并遵循："
         f"1) 译文必须符合{lang}母语者的阅读习惯和审美，流畅、有文采；"
         f"2) 对话要自然生动，符合人物身份；3) 修辞、隐喻、双关尽量找到{lang}对应表达，"
@@ -258,16 +356,30 @@ def build_system_prompt(target_lang, reader_profile="", want_terms=True):
     )
     if HAS_NOTES and NB is not None:
         base += NB.build_terms_instruction(reader_profile, want_terms)
+    # ★ 新增：领域微调
+    if domain in _DOMAIN_PROMPTS:
+        base += _DOMAIN_PROMPTS[domain]
+    # ★ 新增：用户自定义要求
+    if extra_prompt and extra_prompt.strip():
+        base += "\n【用户额外要求】\n" + extra_prompt.strip() + "\n"
     return base
 
 
-def build_simple_system(target_lang):
+def build_simple_system(target_lang, domain="general", extra_prompt=""):
     lang = LANG_NAMES.get(target_lang, "简体中文")
-    return (
-        f"你是一位资深文学翻译家，精通多国语言，译笔力求神似而非字对字。"
+    # ★ 修复：按领域选角色，不再一律"文学翻译家"
+    role = _DOMAIN_ROLES.get(domain, _DOMAIN_ROLES["general"])
+    base = (
+        f"{role}"
         f"请把用户发来的内容翻译成流畅、有文采的【{lang}】，符合{lang}母语者的阅读习惯。"
         f"保留段落结构，不遗漏内容，不总结，不输出解释，直接给出译文。"
     )
+    # ★ 新增
+    if domain in _DOMAIN_PROMPTS:
+        base += _DOMAIN_PROMPTS[domain]
+    if extra_prompt and extra_prompt.strip():
+        base += "\n【用户额外要求】\n" + extra_prompt.strip() + "\n"
+    return base
 
 
 def cache_prefix(target_lang):
@@ -302,6 +414,10 @@ class TaskState:
     last_index: int = 0
     pdf_quality: str = DEFAULT_PDF_QUALITY
     make_bilingual: bool = True
+    # ★ 新增：运行参数存到 task
+    domain: str = "general"
+    extra_prompt: str = ""
+    trial_pages: int = 5
     _preview_scanned: bool = False
     _last_size_ts: float = 0.0
     stop_event: threading.Event = field(default_factory=threading.Event)
@@ -327,13 +443,23 @@ class TaskState:
                 "last_index": self.last_index,
                 "pdf_quality": self.pdf_quality,
                 "make_bilingual": self.make_bilingual,
+                "domain": self.domain,
+                "extra_prompt": self.extra_prompt,
+                "trial_pages": self.trial_pages,
             }
 
     def log_msg(self, m):
         with self._lock:
-            self.log.append(m)
+            # ★ 新增：日志加时间戳
+            ts = time.strftime("%H:%M:%S")
+            self.log.append(f"[{ts}] {m}")
             if len(self.log) > 200:
                 del self.log[:-200]
+
+    def log_tail(self, n=40):
+        """★ 修复：锁内取日志尾部快照，供刷新线程安全读取。"""
+        with self._lock:
+            return "\n".join(self.log[-n:])
 
 
 class TaskManager:
@@ -400,6 +526,9 @@ class TaskManager:
             last_index=state_dict.get("last_index", 0),
             pdf_quality=state_dict.get("pdf_quality", DEFAULT_PDF_QUALITY),
             make_bilingual=state_dict.get("make_bilingual", True),
+            domain=state_dict.get("domain", "general"),
+            extra_prompt=state_dict.get("extra_prompt", ""),
+            trial_pages=state_dict.get("trial_pages", 5),
         )
         with self._lock:
             self._tasks[tid] = t
@@ -413,15 +542,11 @@ def save_state(task, force=False):
     if task is None:
         return
     now = time.monotonic()
-    if not force:
-        with _STATE_SAVE_LOCK:
-            last = _STATE_SAVE_TS.get(task.task_id, 0.0)
-            if now - last < STATE_SAVE_INTERVAL:
-                return
-            _STATE_SAVE_TS[task.task_id] = now
-    else:
-        with _STATE_SAVE_LOCK:
-            _STATE_SAVE_TS[task.task_id] = now
+    with _STATE_SAVE_LOCK:
+        last = _STATE_SAVE_TS.get(task.task_id)
+        if not force and last is not None and (now - last) < STATE_SAVE_INTERVAL:
+            return
+        _STATE_SAVE_TS[task.task_id] = now
 
     try:
         path = os.path.join(task.work_dir, "state.json")
@@ -432,8 +557,9 @@ def save_state(task, force=False):
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, path)
-    except Exception:
-        pass
+    except Exception as e:
+        # ★ 修复：静默失败 → 至少可见
+        print(f"[warn] save_state 保存失败：{e}")
 
 
 def _add_output(task, *paths_):
@@ -482,6 +608,23 @@ def cleanup_orphan_files():
                     print(f"   [clean] {name}/{f}")
                 except Exception:
                     pass
+        # ★ 修复：双语 PDF 检查点文件（崩溃遗留）
+        work_d = os.path.join(d, "_work")
+        if os.path.isdir(work_d):
+            for f in os.listdir(work_d):
+                if "_bilingual_ckpt." in f and f.endswith(".pdf"):
+                    fp = os.path.join(work_d, f)
+                    try:
+                        if time.time() - os.path.getmtime(fp) < 86400:
+                            continue
+                    except Exception:
+                        continue
+                    try:
+                        os.remove(fp)
+                        removed += 1
+                        print(f"   [clean] {name}/_work/{f}")
+                    except Exception:
+                        pass
     return removed
 
 
@@ -536,20 +679,46 @@ def load_json_file(path, default):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
+        except Exception as e:
+            print(f"[warn] 读取 JSON 失败 {path}: {e}")
             return default
     return default
 
 
-def save_json_file(path, data):
-    if not path:
-        return
+def _write_json_file(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with _IO_LOCK:
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp, path)
+
+
+def save_json_file(path, data, force=False):
+    """★ 修复：节流写 JSON——同一路径 3 秒内只记脏引用，
+    超时或 force=True 才真正落盘，避免每页/每段整文件重写放大 IO。"""
+    if not path:
+        return
+    now = time.monotonic()
+    with _IO_LOCK:
+        last = _JSON_LAST_WRITE.get(path)
+        if not force and last is not None and (now - last) < _JSON_DEBOUNCE_SEC:
+            _JSON_PENDING[path] = data
+            return
+        _JSON_LAST_WRITE[path] = now
+    _write_json_file(path, data)
+
+
+def flush_all_json():
+    """把节流中未落盘的 JSON 全部写盘（worker 结束 / 程序退出时调用）。"""
+    with _IO_LOCK:
+        pending = list(_JSON_PENDING.items())
+        _JSON_PENDING.clear()
+    for path, data in pending:
+        try:
+            _write_json_file(path, data)
+        except Exception as e:
+            print(f"[warn] flush JSON 失败 {path}: {e}")
 
 
 def load_progress_file(path):
@@ -676,8 +845,9 @@ def refresh_task_size(task, force=False):
     task._last_size_ts = now
     try:
         task.current_size = _task_disk_size(task)
-    except Exception:
-        pass
+    except Exception as e:
+        # ★ 修复：静默失败 → 至少可见
+        print(f"[warn] refresh_task_size 失败：{e}")
 
 
 def safe_save_pdf(doc, out_path, retries=5, garbage=3):
@@ -698,6 +868,13 @@ def safe_save_pdf(doc, out_path, retries=5, garbage=3):
         except (PermissionError, OSError) as e:
             last_err = e
             time.sleep(0.8 * (attempt + 1))
+
+    if os.path.basename(out_path).endswith(".bak.pdf"):
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise last_err if last_err else RuntimeError("无法保存 PDF")
 
     fallback = out_path[:-4] + ".bak.pdf"
     try:
@@ -767,7 +944,8 @@ def preview_signature(preview_imgs):
     parts = []
     for p in preview_imgs or []:
         try:
-            parts.append(f"{os.path.basename(p)}:{os.path.getmtime(p):.0f}")
+            st = os.stat(p)
+            parts.append(f"{os.path.basename(p)}:{st.st_mtime_ns}:{st.st_size}")
         except Exception:
             parts.append(os.path.basename(p) if p else "")
     return tuple(parts)
@@ -1195,7 +1373,6 @@ def page_is_translated(page, target_lang="zh-CN", src_page=None):
     except Exception:
         return False
 
-    # ★ 修复：空页判断更温和——原文也空则视为已处理
     if not text or not text.strip():
         if src_page is not None:
             try:
@@ -1216,7 +1393,6 @@ def page_is_translated(page, target_lang="zh-CN", src_page=None):
         pass
 
     total_nonspace = sum(1 for c in text if not c.isspace())
-    # ★ 修复：短页（标题页/扉页）不要误判为未翻译
     if total_nonspace < 5:
         if src_page is not None:
             try:
@@ -1344,23 +1520,31 @@ def _api_call(client, model, system, user_content, retries=4, stop_event=None):
                 raise RuntimeError("账户余额不足，请去 DeepSeek 平台充值后再继续")
             if status == 401:
                 raise RuntimeError("API Key 无效或已过期，请检查后重试")
+            # ★ 修复：最后一次重试不再白睡一轮再抛错
+            last_attempt = attempt >= retries - 1
             if status == 429:
+                if last_attempt:
+                    break
                 _interruptible_sleep(10 * (attempt + 1), stop_event)
                 continue
+            if last_attempt:
+                break
             _interruptible_sleep(6 * (attempt + 1), stop_event)
 
     raise RuntimeError(f"API 连续失败：{last_err}")
 
 
 def call_api(client, model, text, target_lang="zh-CN", retries=4,
-             stop_event=None, reader_profile="", want_terms=True):
-    system = build_system_prompt(target_lang, reader_profile, want_terms)
+             stop_event=None, reader_profile="", want_terms=True,
+             domain="general", extra_prompt=""):
+    system = build_system_prompt(target_lang, reader_profile, want_terms,
+                                  domain=domain, extra_prompt=extra_prompt)
     return _api_call(client, model, system, text, retries, stop_event=stop_event)
 
 
 def call_simple_api(client, model, text, target_lang="zh-CN", retries=4,
-                    stop_event=None):
-    system = build_simple_system(target_lang)
+                    stop_event=None, domain="general", extra_prompt=""):
+    system = build_simple_system(target_lang, domain, extra_prompt)
     return _api_call(client, model, system, text, retries, stop_event=stop_event)
 
 
@@ -1380,8 +1564,9 @@ def _pdf_font_setup(page, font_path=None):
         try:
             page.insert_font(fontname=name, fontfile=fp, set_simple=False)
             return name
-        except Exception:
-            pass
+        except Exception as e:
+            # ★ 修复：字体注册失败至少打印，排障时可见
+            print(f"[warn] 字体注册失败 {fp}: {e}")
     return "china-s"
 
 
@@ -1503,13 +1688,17 @@ def apply_translations(page, blocks, translations,
 
 def translate_page(client, model, blocks, cache, cache_file,
                    target_lang="zh-CN", stop_event=None,
-                   reader_profile="", want_terms=True):
+                   reader_profile="", want_terms=True,
+                   domain="general", extra_prompt=""):
     pref = cache_prefix(target_lang)
     cleaned = [_clean_block_text(b[4]) for b in blocks]
     marked = "\n\n".join(f"[[B{i}]] {t}" for i, t in enumerate(cleaned))
 
     terms_suffix = "|T" if (want_terms and HAS_NOTES) else ""
-    key = f"pg_{pref}" + h(marked + terms_suffix)
+    # ★ 优化：缓存 key 加上 domain + extra_prompt
+    domain_suffix = f"|D{domain}" if domain and domain != "general" else ""
+    extra_suffix = ("|X" + h(extra_prompt)) if (extra_prompt and extra_prompt.strip()) else ""
+    key = f"pg_{pref}" + h(marked + terms_suffix + domain_suffix + extra_suffix)
 
     if key in cache:
         try:
@@ -1532,7 +1721,8 @@ def translate_page(client, model, blocks, cache, cache_file,
     raw = call_api(client, model, marked, target_lang,
                    stop_event=stop_event,
                    reader_profile=reader_profile,
-                   want_terms=(want_terms and HAS_NOTES))
+                   want_terms=(want_terms and HAS_NOTES),
+                   domain=domain, extra_prompt=extra_prompt)
 
     if HAS_NOTES and NB is not None:
         body, terms_raw = NB.split_translation_and_terms(raw)
@@ -1554,7 +1744,8 @@ def translate_page(client, model, blocks, cache, cache_file,
             )
             r = call_api(client, model, batch_marked, target_lang,
                          stop_event=stop_event,
-                         reader_profile=reader_profile, want_terms=False)
+                         reader_profile=reader_profile, want_terms=False,
+                         domain=domain, extra_prompt=extra_prompt)
             if HAS_NOTES and NB is not None:
                 body2, _ = NB.split_translation_and_terms(r)
             else:
@@ -1583,7 +1774,8 @@ def translate_page(client, model, blocks, cache, cache_file,
             try:
                 r = call_api(client, model, f"[[B0]] {cleaned[i]}",
                              target_lang, stop_event=stop_event,
-                             reader_profile=reader_profile, want_terms=False)
+                             reader_profile=reader_profile, want_terms=False,
+                             domain=domain, extra_prompt=extra_prompt)
                 if HAS_NOTES and NB is not None:
                     body2, _ = NB.split_translation_and_terms(r)
                 else:
@@ -1615,10 +1807,23 @@ def translate_page(client, model, blocks, cache, cache_file,
 
 
 def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
-    clear_dir_preview(paths["preview_dir"])
-    os.makedirs(paths["preview_dir"], exist_ok=True)
+    preview_dir = paths["preview_dir"]
+    tmp_dir = preview_dir + ".new"
+
+    if os.path.isdir(tmp_dir):
+        for pat in ("*.png", "*.jpg", "*.jpeg"):
+            for f in glob.glob(os.path.join(tmp_dir, pat)):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+    os.makedirs(tmp_dir, exist_ok=True)
 
     if not os.path.exists(trans_path):
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
         return []
 
     try:
@@ -1627,6 +1832,10 @@ def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
         trans = fitz.open(stream=data, filetype="pdf")
     except Exception as e:
         print(f"[preview] open trans failed: {e}")
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
         return []
 
     try:
@@ -1634,6 +1843,10 @@ def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
     except Exception as e:
         print(f"[preview] open src failed: {e}")
         trans.close()
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
         return []
 
     n = min(n_preview, len(orig), len(trans))
@@ -1662,7 +1875,7 @@ def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
                     (PREVIEW_MAX_WIDTH, int(canvas.height * ratio)),
                     _RESAMPLE,
                 )
-            p = os.path.join(paths["preview_dir"], f"compare_{i:04d}.jpg")
+            p = os.path.join(tmp_dir, f"compare_{i:04d}.jpg")
             canvas.save(p, "JPEG", quality=PREVIEW_JPEG_QUALITY, optimize=True)
             preview_imgs.append(p)
         except Exception as e:
@@ -1670,7 +1883,49 @@ def render_preview_only(trans_path, paths, task, n_preview=PREVIEW_PAGES):
             continue
     orig.close()
     trans.close()
-    return preview_imgs
+
+    if not preview_imgs:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        return []
+
+    old_dir = preview_dir + ".old"
+    try:
+        if os.path.isdir(old_dir):
+            shutil.rmtree(old_dir, ignore_errors=True)
+    except Exception:
+        pass
+    if os.path.isdir(preview_dir):
+        try:
+            os.rename(preview_dir, old_dir)
+        except Exception:
+            try:
+                shutil.rmtree(preview_dir, ignore_errors=True)
+            except Exception:
+                pass
+    try:
+        os.rename(tmp_dir, preview_dir)
+    except Exception:
+        if not os.path.isdir(preview_dir) and os.path.isdir(old_dir):
+            try:
+                os.rename(old_dir, preview_dir)
+            except Exception:
+                pass
+        return []
+    try:
+        if os.path.isdir(old_dir):
+            shutil.rmtree(old_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    new_imgs = []
+    for i in range(len(preview_imgs)):
+        new_p = os.path.join(preview_dir, f"compare_{i:04d}.jpg")
+        if os.path.exists(new_p):
+            new_imgs.append(new_p)
+    return new_imgs
 
 
 def _collect_existing_previews(task):
@@ -1724,6 +1979,40 @@ def make_bilingual_pdf(trans_path, paths, task,
         done_count = 0
         n_total = len(pages)
 
+        # ★ 修复：每 BILINGUAL_FLUSH_EVERY 页检查点落盘并重开 out_doc，
+        # 释放已插入页的内存（300+ 页印刷级原本峰值可达数百 MB ~ 1GB）
+        ckpt_a = os.path.join(task.work_dir, "_bilingual_ckpt.1.pdf")
+        ckpt_b = os.path.join(task.work_dir, "_bilingual_ckpt.2.pdf")
+        out_doc_holder = [out_doc]
+        ckpt_toggle = 0
+
+        def _checkpoint_flush():
+            """落盘并重开 out_doc；失败时保证 out_doc_holder[0] 仍可用。"""
+            nonlocal ckpt_toggle
+            doc = out_doc_holder[0]
+            ckpt = ckpt_a if ckpt_toggle % 2 == 0 else ckpt_b
+            ckpt_toggle += 1
+            prev = ckpt_b if ckpt is ckpt_a else ckpt_a
+            try:
+                doc.save(ckpt + ".new", deflate=True, garbage=0)
+                doc.close()
+                out_doc_holder[0] = None
+            except Exception:
+                return False
+            try:
+                os.replace(ckpt + ".new", ckpt)
+                out_doc_holder[0] = fitz.open(ckpt)
+            except Exception:
+                # replace 失败：改从 .new 继续（内容完整）
+                out_doc_holder[0] = fitz.open(ckpt + ".new")
+                return False
+            try:
+                if os.path.exists(prev):
+                    os.remove(prev)
+            except Exception:
+                pass
+            return True
+
         zoom_val = float(zoom) if zoom else BILINGUAL_ZOOM
         jpeg_val = int(jpeg_quality) if jpeg_quality else BILINGUAL_JPEG_QUALITY
         zoom_mat = fitz.Matrix(zoom_val, zoom_val)
@@ -1761,7 +2050,7 @@ def make_bilingual_pdf(trans_path, paths, task,
                 buf.close()
 
                 w, ph = canvas.size
-                page = out_doc.new_page(width=w, height=ph)
+                page = out_doc_holder[0].new_page(width=w, height=ph)
                 page.insert_image(fitz.Rect(0, 0, w, ph), stream=img_bytes)
 
                 canvas.close()
@@ -1771,6 +2060,24 @@ def make_bilingual_pdf(trans_path, paths, task,
 
                 if done_count % 10 == 0 or done_count == n_total:
                     task.log_msg(f"📐 双语 PDF {done_count}/{n_total} 页")
+
+                if (done_count % BILINGUAL_FLUSH_EVERY == 0
+                        and done_count < n_total):
+                    try:
+                        if not _checkpoint_flush():
+                            task.log_msg("⚠️ 双语 PDF 检查点异常（继续内存生成）")
+                    except Exception as e:
+                        task.log_msg(f"⚠️ 双语 PDF 检查点失败：{e}")
+                    if out_doc_holder[0] is None:
+                        # 双保险：从最新的检查点文件恢复，避免丢已生成页
+                        cand = None
+                        for c in (ckpt_a + ".new", ckpt_a,
+                                  ckpt_b + ".new", ckpt_b):
+                            if os.path.exists(c):
+                                cand = c
+                                break
+                        out_doc_holder[0] = fitz.open(cand) if cand \
+                            else fitz.open()
             except Exception as e:
                 task.log_msg(f"⚠️ 双语 PDF 第 {pno} 页失败：{e}")
                 continue
@@ -1780,7 +2087,7 @@ def make_bilingual_pdf(trans_path, paths, task,
 
         if done_count > 0:
             try:
-                saved = safe_save_pdf(out_doc, paths["bilingual_pdf"],
+                saved = safe_save_pdf(out_doc_holder[0], paths["bilingual_pdf"],
                                       garbage=garbage)
                 if saved != paths["bilingual_pdf"]:
                     task.log_msg(
@@ -1791,11 +2098,22 @@ def make_bilingual_pdf(trans_path, paths, task,
                     f"✅ 双语 PDF 生成完成：{done_count} 页 → "
                     f"{os.path.basename(paths['bilingual_pdf'])}"
                 )
+                # 成功落盘后清理检查点文件
+                for ck in (ckpt_a, ckpt_b):
+                    for ext in ("", ".new"):
+                        try:
+                            if os.path.exists(ck + ext):
+                                os.remove(ck + ext)
+                        except Exception:
+                            pass
             except Exception as e:
                 task.log_msg(f"⚠️ 双语 PDF 保存失败：{e}")
         else:
             task.log_msg("⚠️ 双语 PDF 生成 0 页")
-        out_doc.close()
+        try:
+            out_doc_holder[0].close()
+        except Exception:
+            pass
     except Exception as e:
         import traceback
         task.log_msg(f"⚠️ 双语 PDF 生成异常：{e}")
@@ -1955,7 +2273,6 @@ def insert_notes_into_pdf(pdf_path, global_terms, book_title,
         except Exception:
             pass
 
-        # ★ 修复：显式指定 from_page / to_page，避免默认 -1 语义歧义
         if position == "front":
             main_doc.insert_pdf(notes_doc,
                                 from_page=0,
@@ -2028,13 +2345,6 @@ def insert_notes_into_pdf(pdf_path, global_terms, book_title,
 # ============================================================
 
 def _docx_replace_para_text(para, new_text):
-    """
-    替换段落文本。
-
-    ★ 说明：多 run 场景下，用第一个 run 的字符格式承载全部译文，
-    其余 run 清空。这是 python-docx 下最稳妥的策略——按比例拆
-    分到各 run 反而会因为译文长度变化导致格式错乱。
-    """
     if para.runs:
         para.runs[0].text = new_text
         for r in para.runs[1:]:
@@ -2066,7 +2376,6 @@ def _docx_insert_after(para, text):
 
 
 def _pptx_set_para_text(para, new_text):
-    """★ 修复：空 run 时用 add_run，避免 para.text 在某些版本上抛异常。"""
     if para.runs:
         para.runs[0].text = new_text
         for r in para.runs[1:]:
@@ -2095,7 +2404,8 @@ def _iter_pptx_shapes(shapes):
 
 
 def translate_batch_office(client, model, texts, cache, cache_file,
-                           target_lang="zh-CN", stop_event=None, task=None):
+                           target_lang="zh-CN", stop_event=None, task=None,
+                           domain="general", extra_prompt=""):
     pref = cache_prefix(target_lang)
     results = [None] * len(texts)
     failed = set()
@@ -2119,7 +2429,7 @@ def translate_batch_office(client, model, texts, cache, cache_file,
         chunk = pending[start:start + OFFICE_BATCH_SIZE]
         marked = "\n\n".join(f"[[B{j}]] {t}" for j, (_, t) in enumerate(chunk))
         try:
-            system = build_simple_system(target_lang)
+            system = build_simple_system(target_lang, domain, extra_prompt)
             raw = _api_call(client, model, system, marked, stop_event=stop_event)
             parsed = parse_marked(raw, len(chunk))
             for j, (gi, t) in enumerate(chunk):
@@ -2140,7 +2450,9 @@ def translate_batch_office(client, model, texts, cache, cache_file,
                     break
                 try:
                     tr = call_simple_api(client, model, t, target_lang,
-                                         stop_event=stop_event)
+                                         stop_event=stop_event,
+                                         domain=domain,
+                                         extra_prompt=extra_prompt)
                     results[gi] = tr
                     cache[ckey(t)] = tr
                     any_success = True
@@ -2159,11 +2471,8 @@ def translate_batch_office(client, model, texts, cache, cache_file,
     ):
         raise RuntimeError("所有段落翻译均失败，请检查 API Key / 余额 / 网络")
 
-    fail_count = 0
-    for i in range(len(results)):
-        if results[i] is None:
-            results[i] = texts[i]
-            fail_count += 1
+    # ★ 修复：失败段落保持 None（不再用原文冒充译文），由调用方跳过并标记
+    fail_count = sum(1 for r in results if r is None)
 
     return results, fail_count
 
@@ -2174,8 +2483,12 @@ def translate_batch_office(client, model, texts, cache, cache_file,
 
 def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
                reader_profile="", want_terms=True,
-               font_path="", max_font_size=DEFAULT_FONT_SIZE):
-    client = OpenAI(api_key=real_key, base_url="https://api.deepseek.com")
+               font_path="", max_font_size=DEFAULT_FONT_SIZE,
+               domain="general", extra_prompt="", trial_pages=5):
+    # ★ 修复：base_url 进 .env；设 timeout + max_retries=0（避免 SDK
+    # 默认 600s 超时 × 内置重试 × 自写重试叠加，停止信号无法打断）
+    client = OpenAI(api_key=real_key, base_url=DEEPSEEK_BASE_URL,
+                    timeout=API_TIMEOUT, max_retries=0)
     cache = load_json_file(paths["cache_file"], {})
     done_pages = load_progress_file(paths["progress_file"])
 
@@ -2213,6 +2526,10 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
     task.log_msg(f"📏 正文字号上限：{max_font_size}pt")
     if target_lang in RTL_LANGS:
         task.log_msg(f"↔️ 目标语言为 RTL，使用右对齐")
+    if domain != "general":
+        task.log_msg(f"📚 领域微调：{domain}")
+    if extra_prompt and extra_prompt.strip():
+        task.log_msg(f"📝 已启用自定义要求（{len(extra_prompt)} 字）")
 
     try:
         with fitz.open(task.src_path) as _tmp_doc:
@@ -2259,7 +2576,12 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
             orig_check = fitz.open(task.src_path)
             actually_done = set()
             checked = 0
-            for i in range(min(len(doc), len(orig_check))):
+            n_pages = min(len(doc), len(orig_check))
+            # ★ 修复：抽样校验（最多 ~40 页），全量逐页 get_text 大书要几十秒。
+            # 只有抽中且确认已翻的页才进 actually_done（无假阳性）；
+            # 未抽中页走正常流程，缓存命中不重复扣费。
+            stride = max(1, n_pages // 40)
+            for i in range(0, n_pages, stride):
                 if task.stop_event.is_set():
                     break
                 checked += 1
@@ -2269,19 +2591,18 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
 
             reported = len(done_pages)
             actual = len(actually_done)
-            task.log_msg(f"🔎 内容校验：译文共 {checked} 页，其中已翻译的 {actual} 页")
-
-            if reported != actual:
-                missing = sorted(set(range(1, checked + 1)) - actually_done)
-                task.log_msg(f"⚠️ 进度记录说已翻 {reported} 页，但实际只有 {actual} 页")
-                if missing:
-                    task.log_msg(f"   待补翻页码前 20 个：{missing[:20]}"
-                                 f"{'...' if len(missing) > 20 else ''}")
-                    task.log_msg(f"   共 {len(missing)} 页需要补翻")
-                else:
-                    task.log_msg(f"   进度多余 {reported - actual} 页，已修正")
-            else:
-                task.log_msg(f"✅ 进度与实际内容一致")
+            task.log_msg(
+                f"🔎 内容校验（抽样 {checked}/{n_pages} 页）：确认已翻 {actual} 页"
+            )
+            if checked and actual == 0:
+                task.log_msg(
+                    "⚠️ 抽样页全部未翻译，将整体重翻（缓存命中不重复扣费）"
+                )
+            elif actual < checked:
+                task.log_msg(
+                    f"ℹ️ 抽样中发现 {checked - actual} 页未翻译，"
+                    f"进度记录原报 {reported} 页，已按实际修正"
+                )
 
             done_pages = actually_done
             save_progress_file(paths["progress_file"], done_pages)
@@ -2289,7 +2610,8 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
             task.log_msg(f"⚠️ 内容校验失败（不影响继续）：{e}")
 
     total = len(doc)
-    limit = min(5, total) if trial else total
+    # ★ 优化：试翻页数可配置
+    limit = min(trial_pages, total) if trial else total
 
     task.status = "running"
     task.total = limit
@@ -2322,7 +2644,7 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
             all_pages_ok = False
             break
         page_num = pno + 1
-        if page_num > limit and page_num not in done_pages:
+        if page_num > limit:
             break
         if page_num in done_pages:
             continue
@@ -2346,6 +2668,7 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
                 stop_event=task.stop_event,
                 reader_profile=reader_profile,
                 want_terms=enable_terms,
+                domain=domain, extra_prompt=extra_prompt,
             )
             trans_complete = all(
                 (trans.get(i) or "").strip() for i in range(len(blocks))
@@ -2661,8 +2984,12 @@ def pdf_worker(task, paths, real_key, model, trial, target_lang="zh-CN",
     save_state(task, force=True)
 
 
-def docx_worker(task, paths, real_key, model, target_lang="zh-CN"):
-    client = OpenAI(api_key=real_key, base_url="https://api.deepseek.com")
+def docx_worker(task, paths, real_key, model, target_lang="zh-CN",
+                domain="general", extra_prompt=""):
+    # ★ 修复：base_url 进 .env；设 timeout + max_retries=0（避免 SDK
+    # 默认 600s 超时 × 内置重试 × 自写重试叠加，停止信号无法打断）
+    client = OpenAI(api_key=real_key, base_url=DEEPSEEK_BASE_URL,
+                    timeout=API_TIMEOUT, max_retries=0)
     cache = load_json_file(paths["cache_file"], {})
 
     est = estimate_output_size("docx", task.src_path, 0,
@@ -2715,6 +3042,7 @@ def docx_worker(task, paths, real_key, model, target_lang="zh-CN"):
         translated, fail_count = translate_batch_office(
             client, model, all_texts, cache, paths["cache_file"],
             target_lang, stop_event=task.stop_event, task=task,
+            domain=domain, extra_prompt=extra_prompt,
         )
     except RuntimeError as e:
         task.status = "error"
@@ -2727,6 +3055,11 @@ def docx_worker(task, paths, real_key, model, target_lang="zh-CN"):
     for i, (para, tr) in enumerate(zip(all_targets, translated)):
         if task.stop_event.is_set():
             break
+        if tr is None:
+            # ★ 修复：翻译失败的段落不把原文写回译文
+            task.current = i + 1
+            task.label = f"Word 应用 {i+1}/{total_targets}"
+            continue
         _docx_replace_para_text(para, tr)
         if len(preview_pairs) < PREVIEW_PARAS:
             preview_pairs.append((all_texts[i], tr))
@@ -2763,13 +3096,22 @@ def docx_worker(task, paths, real_key, model, target_lang="zh-CN"):
                             if p.text.strip():
                                 cell_bi.append(p)
             all_bi = para_bi + cell_bi
+            fail_bi = 0
             for i, para in enumerate(all_bi):
                 if task.stop_event.is_set():
                     break
                 src = para.text
                 key = f"t_{cache_prefix(target_lang)}" + h(src)
-                tr = cache.get(key) or src
+                tr = cache.get(key)
+                if not tr:
+                    # ★ 修复：翻译失败的段落插入失败标记，不再原文冒充译文
+                    tr = "⚠ 翻译失败（无译文）"
+                    fail_bi += 1
                 _docx_insert_after(para, tr)
+            if fail_bi:
+                task.log_msg(
+                    f"⚠️ 双语版有 {fail_bi} 段翻译失败，已插入失败标记"
+                )
             doc_bi.save(paths["office_bi"])
             task.log_msg(f"✅ 双语版已保存：{paths['office_bi']}")
             bi_ok = True
@@ -2797,8 +3139,12 @@ def docx_worker(task, paths, real_key, model, target_lang="zh-CN"):
     save_state(task, force=True)
 
 
-def pptx_worker(task, paths, real_key, model, target_lang="zh-CN"):
-    client = OpenAI(api_key=real_key, base_url="https://api.deepseek.com")
+def pptx_worker(task, paths, real_key, model, target_lang="zh-CN",
+                domain="general", extra_prompt=""):
+    # ★ 修复：base_url 进 .env；设 timeout + max_retries=0（避免 SDK
+    # 默认 600s 超时 × 内置重试 × 自写重试叠加，停止信号无法打断）
+    client = OpenAI(api_key=real_key, base_url=DEEPSEEK_BASE_URL,
+                    timeout=API_TIMEOUT, max_retries=0)
     cache = load_json_file(paths["cache_file"], {})
 
     est = estimate_output_size("pptx", task.src_path, 0,
@@ -2844,6 +3190,7 @@ def pptx_worker(task, paths, real_key, model, target_lang="zh-CN"):
         translated, fail_count = translate_batch_office(
             client, model, texts, cache, paths["cache_file"],
             target_lang, stop_event=task.stop_event, task=task,
+            domain=domain, extra_prompt=extra_prompt,
         )
     except RuntimeError as e:
         task.status = "error"
@@ -2856,6 +3203,11 @@ def pptx_worker(task, paths, real_key, model, target_lang="zh-CN"):
     for i, ((si, para), tr) in enumerate(zip(targets, translated)):
         if task.stop_event.is_set():
             break
+        if tr is None:
+            # ★ 修复：翻译失败的段落不把原文写回译文
+            task.current = i + 1
+            task.label = f"PPT {i+1}/{total_targets}（第 {si+1} 张）"
+            continue
         _pptx_set_para_text(para, tr)
         if len(preview_pairs) < PREVIEW_PARAS:
             preview_pairs.append((si + 1, texts[i], tr))
@@ -2913,7 +3265,8 @@ def start_task(kind, upload_path, real_key, model, trial, target_lang="zh-CN",
                reader_profile="", want_terms=True,
                font_path="", max_font_size=DEFAULT_FONT_SIZE,
                pdf_quality=DEFAULT_PDF_QUALITY, make_bilingual=True,
-               display_name=None, out_subdir=None, warnings=None):
+               display_name=None, out_subdir=None, warnings=None,
+               domain="general", extra_prompt="", trial_pages=5):
     global SELECTED_TASK_ID
     raw_name = display_name or os.path.basename(upload_path)
     src_name = safe_dirname(os.path.basename(raw_name))
@@ -2933,6 +3286,9 @@ def start_task(kind, upload_path, real_key, model, trial, target_lang="zh-CN",
 
     task.pdf_quality = pdf_quality or DEFAULT_PDF_QUALITY
     task.make_bilingual = bool(make_bilingual)
+    task.domain = domain or "general"
+    task.extra_prompt = extra_prompt or ""
+    task.trial_pages = int(trial_pages or 5)
 
     lang_label = LANG_NAMES.get(target_lang, target_lang)
     task.log_msg(f"🆔 任务 {task.task_id} 已创建（{kind}，目标语言：{lang_label}）")
@@ -2947,16 +3303,23 @@ def start_task(kind, upload_path, real_key, model, trial, target_lang="zh-CN",
                            reader_profile=reader_profile,
                            want_terms=want_terms,
                            font_path=font_path,
-                           max_font_size=max_font_size)
+                           max_font_size=max_font_size,
+                           domain=domain, extra_prompt=extra_prompt,
+                           trial_pages=task.trial_pages)
             elif kind == "docx":
-                docx_worker(task, paths, real_key, model, target_lang)
+                docx_worker(task, paths, real_key, model, target_lang,
+                            domain=domain, extra_prompt=extra_prompt)
             elif kind == "pptx":
-                pptx_worker(task, paths, real_key, model, target_lang)
+                pptx_worker(task, paths, real_key, model, target_lang,
+                            domain=domain, extra_prompt=extra_prompt)
         except Exception as e:
             task.status = "error"
             task.error = str(e)
             task.log_msg(f"❌ 未捕获错误：{e}")
             save_state(task, force=True)
+        finally:
+            # ★ 修复：任务结束（含出错/停止）时把节流的缓存 JSON 落盘
+            flush_all_json()
 
     task.thread = threading.Thread(target=runner, daemon=True)
     task.thread.start()
@@ -2967,6 +3330,7 @@ def on_start(api_key, model, doc_file, mode, trial, target_lang,
              reader_profile, want_terms,
              font_choice, font_size,
              pdf_quality, make_bilingual_cb,
+             domain, extra_prompt, trial_pages,
              stop_dd_value=None):
     global SELECTED_TASK_ID
 
@@ -2974,6 +3338,8 @@ def on_start(api_key, model, doc_file, mode, trial, target_lang,
 
     real_key = (api_key or "").strip() or DEFAULT_API_KEY
     if not real_key or doc_file is None:
+        # ★ 修复：给用户可见反馈
+        gr.Warning("请先上传文档（并确认已填写 API Key）")
         return on_refresh_fast(stop_dd_value) + ([], keep_upload)
 
     model = (model or DEFAULT_MODEL).strip()
@@ -2982,6 +3348,15 @@ def on_start(api_key, model, doc_file, mode, trial, target_lang,
 
     if target_lang not in LANG_NAMES:
         target_lang = "zh-CN"
+
+    if domain not in _DOMAIN_PROMPTS:
+        domain = "general"
+    try:
+        trial_pages = int(trial_pages)
+    except Exception:
+        trial_pages = 5
+    if trial_pages not in (3, 5, 10, 20):
+        trial_pages = 5
 
     user_font_path = FONTS_MAP.get(font_choice, "") if font_choice else ""
     sel_font_path = _auto_pick_font(target_lang, user_font_path)
@@ -3014,16 +3389,19 @@ def on_start(api_key, model, doc_file, mode, trial, target_lang,
     elif name_lower.endswith(".pptx"):
         kind = "pptx"
     else:
+        # ★ 修复：错误直接反馈到网页，不再只进控制台
         print(f"[on_start] 不支持的文件类型：{display_name}")
+        gr.Warning(f"不支持的文件类型：{display_name}"
+                   f"（仅支持 .pdf / .docx / .pptx）")
         return on_refresh_fast(stop_dd_value) + ([], keep_upload)
 
     if kind in ("docx", "pptx") and not HAS_OFFICE:
         print(f"[on_start] 未安装 python-docx / python-pptx，无法处理 {display_name}")
+        gr.Warning("未安装 python-docx / python-pptx，无法处理 Word / PPT")
         return on_refresh_fast(stop_dd_value) + ([], keep_upload)
 
     warnings = []
 
-    # ★ 优化：校验文档类型选择与文件后缀是否一致
     _mode_ext = {
         "📕 PDF 书籍": ".pdf",
         "📘 Word 文档": ".docx",
@@ -3072,9 +3450,14 @@ def on_start(api_key, model, doc_file, mode, trial, target_lang,
                        make_bilingual=make_bilingual_cb,
                        display_name=src_name,
                        out_subdir=out_dir_name,
-                       warnings=warnings)
+                       warnings=warnings,
+                       domain=domain,
+                       extra_prompt=extra_prompt or "",
+                       trial_pages=trial_pages)
         except Exception as e:
             print(f"[on_start] 创建任务失败：{e}")
+            # ★ 修复：错误反馈到网页，而不是只进控制台
+            gr.Warning(f"创建任务失败：{e}")
 
     return on_refresh_fast(stop_dd_value) + ([], keep_upload)
 
@@ -3136,7 +3519,6 @@ def on_load_preview():
 
     imgs = [p for p in (current.preview_images or [])
             if p and os.path.exists(p)]
-    # ★ 优化：内存为空时从磁盘恢复（每次点击都重新扫，但只在真的空时才扫）
     if not imgs:
         imgs = _collect_existing_previews(current)
         if imgs:
@@ -3147,10 +3529,30 @@ def on_load_preview():
     return build_preview_html(imgs, ph), files
 
 
+# ★ 新增：任务列表筛选切换
+def on_filter_change(value):
+    global _TASK_FILTER
+    with _REFRESH_LOCK:
+        _TASK_FILTER = value or "all"
+    return on_refresh_fast()
+
+
 def build_task_list_html(tasks):
     if not tasks:
         return ('<div style="padding:18px;color:#a9a49a;font-size:13px;'
                 'text-align:center">暂无任务</div>')
+
+    # ★ 新增：按 _TASK_FILTER 过滤
+    total_before = len(tasks)
+    if _TASK_FILTER != "all":
+        if _TASK_FILTER == "running":
+            tasks = [t for t in tasks
+                     if t.status in ("queued", "running", "stopping")]
+        else:
+            tasks = [t for t in tasks if t.status == _TASK_FILTER]
+        if not tasks:
+            return ('<div style="padding:18px;color:#a9a49a;font-size:13px;'
+                    'text-align:center">当前筛选下没有任务</div>')
 
     status_color = {"queued": "#8b8578", "running": "#0f3d3e",
                     "stopping": "#b8860b", "paused": "#b8860b",
@@ -3200,7 +3602,6 @@ def build_task_list_html(tasks):
 
     rows_html = "".join(rows)
 
-    # ★ 优化：超过 8 个任务时提示还有多少未显示
     if len(tasks) > 8:
         rows_html += (
             f'<div style="padding:10px 14px;text-align:center;'
@@ -3208,11 +3609,26 @@ def build_task_list_html(tasks):
             f'… 还有 {len(tasks) - 8} 个任务未显示</div>'
         )
 
+    # ★ 新增：筛选视图 footer
+    footer = ""
+    if _TASK_FILTER != "all":
+        footer = (
+            f'<div style="padding:8px 14px;text-align:center;'
+            f'color:#8b8578;font-size:11.5px;background:#fdfcf8;'
+            f'border-top:1px solid #f2ede0">'
+            f'筛选视图：{_TASK_FILTER}（共 {total_before} 个任务）</div>'
+        )
+
     return (f'<div style="background:#fff;border:1px solid #ebe5d8;'
-            f'border-radius:14px;overflow:hidden">{rows_html}</div>')
+            f'border-radius:14px;overflow:hidden">{rows_html}{footer}</div>')
 
 
 def on_refresh_fast(stop_dd_value=None):
+    with _REFRESH_LOCK:
+        return _on_refresh_fast_locked(stop_dd_value)
+
+
+def _on_refresh_fast_locked(stop_dd_value=None):
     global _SELECTED_STOP_VALUE
     tasks = MANAGER.all_sorted()
     task_list_html = build_task_list_html(tasks)
@@ -3240,7 +3656,7 @@ def on_refresh_fast(stop_dd_value=None):
             estimated_size=current.estimated_size,
             warning=warning,
         )
-        log_text = "\n".join(current.log[-40:])
+        log_text = current.log_tail(40)
         previews = [p for p in (current.preview_images or [])
                     if p and os.path.exists(p)]
         if not previews and not getattr(current, "_preview_scanned", False):
@@ -3280,9 +3696,6 @@ def on_refresh_fast(stop_dd_value=None):
     _SELECTED_STOP_VALUE = preserve
     dd_update = gr.update(choices=choices, value=preserve)
 
-    # ★ 修复：用全部任务 id 作为 alive 集合。
-    #   之前用 tasks[:50] 会导致超过 50 个任务时，早完成的 done 任务
-    #   被清出 _MODAL_SHOWN → 弹窗反复触发。
     alive_ids = {t.task_id for t in tasks}
     for k in list(_LAST_PREVIEW_SIG.keys()):
         if k not in alive_ids:
@@ -3293,16 +3706,14 @@ def on_refresh_fast(stop_dd_value=None):
     for k in list(_STATE_SAVE_TS.keys()):
         if k not in alive_ids:
             _STATE_SAVE_TS.pop(k, None)
-    for k in list(_MODAL_SHOWN):
-        if k not in alive_ids:
-            _MODAL_SHOWN.discard(k)
+    # ★ 优化：删掉 _MODAL_SHOWN 死代码（永不命中的遍历），靠 _MODAL_SHOWN_MAX 兜底
 
-    # ★ 修复：弹窗只弹一次；默认返回 gr.update() 表示"不改"，
-    #        避免下一次 tick 用空字符串把已弹出的弹窗清掉。
     modal_html = gr.update()
     for t in tasks:
         if t.status == "done" and t.task_id not in _MODAL_SHOWN:
-            _MODAL_SHOWN.add(t.task_id)
+            _MODAL_SHOWN[t.task_id] = True
+            while len(_MODAL_SHOWN) > _MODAL_SHOWN_MAX:
+                _MODAL_SHOWN.popitem(last=False)
             try:
                 refresh_task_size(t, force=True)
             except Exception:
@@ -3338,42 +3749,52 @@ def open_result_folder():
 
 
 # ============================================================
-# 优雅退出（Ctrl+C 秒退）
+# 优雅退出
 # ============================================================
 
 _sigint_count = [0]
 
 
 def _shutdown():
-    """
-    保存所有运行中任务的状态。
-
-    ★ 修复：直接写盘，绕过 _STATE_SAVE_LOCK / _IO_LOCK。
-    信号处理函数跑在主线程，如果此时 worker 线程正持有锁，
-    用锁会阻塞 Ctrl+C，用户感觉"卡住"。反正紧接着就 os._exit(0)，
-    锁没有意义，直接原子写即可。
-
-    ★ 修复：tmp 文件名用 .exit.tmp，避免和 worker 线程的
-    state.json.tmp 撞名（可能导致读到截断的 state.json）。
-    """
     try:
         for t in MANAGER.running():
             try:
                 t.stop_event.set()
-                t.log_msg("🛑 程序退出，正在停止…")
 
                 path = os.path.join(t.work_dir, "state.json")
                 os.makedirs(t.work_dir, exist_ok=True)
-                data = t.to_dict()
 
-                tmp = path + ".exit.tmp"
+                data = {
+                    "task_id": t.task_id, "kind": t.kind,
+                    "src_name": t.src_name, "out_dir": t.out_dir,
+                    "target_lang": t.target_lang, "created_at": t.created_at,
+                    "status": "paused",
+                    "current": t.current, "total": t.total,
+                    "label": t.label,
+                    "log": [x for x in t.log_tail(60).split("\n") if x],
+                    "output_files": list(t.output_files or []),
+                    "error": t.error,
+                    "estimated_size": t.estimated_size,
+                    "current_size": t.current_size,
+                    "last_index": t.last_index,
+                    "pdf_quality": t.pdf_quality,
+                    "make_bilingual": t.make_bilingual,
+                    "domain": t.domain,
+                    "extra_prompt": t.extra_prompt,
+                    "trial_pages": t.trial_pages,
+                }
+                tmp = path + f".exit.{uuid.uuid4().hex[:8]}.tmp"
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                 os.replace(tmp, path)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as e:
+                print(f"[shutdown] 保存任务 {getattr(t, 'task_id', '?')} "
+                      f"失败：{e}", flush=True)
+    except Exception as e:
+        print(f"[shutdown] 整体失败：{e}", flush=True)
+    finally:
+        # ★ 修复：退出前把节流的缓存 JSON 落盘
+        flush_all_json()
 
 
 atexit.register(_shutdown)
@@ -3751,7 +4172,8 @@ with gr.Blocks(
         保留原排版<span class="dot">·</span>多任务并行
         <span class="dot">·</span>断点可续<span class="dot">·</span>
         12 种语言<span class="dot">·</span>术语笔记
-        <span class="dot">·</span>质量可选
+        <span class="dot">·</span>领域微调<span class="dot">·</span>
+        质量可选
       </div>
     </div>
     """)
@@ -3764,8 +4186,12 @@ with gr.Blocks(
           <div><b>🌐 语言</b>　简体/繁体中文、英、日、韩、法、德、西、葡、俄、阿、意</div>
           <div><b>🔤 字体</b>　自动扫描 <code>D:\\file\\translate\\word_type</code> 目录下的字体（仅对 PDF 生效）</div>
           <div><b>📏 字号</b>　正文字号上限，实际会根据原文框自动缩小</div>
+          <div><b>📚 领域</b>　通用 / 技术 / 文学 / 新闻 / 法律 / 医学，会微调系统提示词</div>
+          <div><b>📝 自定义要求</b>　会追加到系统提示词，比如「术语要统一」「人名不译」</div>
+          <div><b>🧪 试翻页数</b>　3 / 5 / 10 / 20 可选</div>
           <div><b>🎨 质量</b>　仅对 PDF 的 <code>bilingual.pdf</code> 生效；取消勾选可完全跳过双语 PDF（体积减少约 90%）</div>
           <div><b>📓 术语表</b>　勾选后，术语页会插在 PDF 正文前（带书签）；notes.html 支持鼠标悬停查词 + 点击定位到原文页</div>
+          <div><b>🔍 任务筛选</b>　任务列表右上角可切换「全部 / 运行中 / 已完成 / 出错」</div>
           <div><b>📁 输出位置</b>　译文在 <code>trans_result/&lt;文件名&gt;/</code>，笔记在 <code>_&lt;文件名&gt;/</code></div>
           <div style="margin-top:10px;padding-top:10px;border-top:1px dashed #e2dccb">
             <b>📚 三种成品</b>
@@ -3778,7 +4204,6 @@ with gr.Blocks(
         </div>
         """)
 
-    # ================= 上部：左设置 / 右状态 =================
     with gr.Row(equal_height=False, elem_id="main_row"):
 
         with gr.Column(scale=1, min_width=440, elem_id="setup_col"):
@@ -3860,6 +4285,28 @@ with gr.Blocks(
                 elem_id="quality_hint",
             )
 
+            # ★ 新增：领域 + 试翻页数
+            with gr.Row(equal_height=True):
+                domain_dd = gr.Dropdown(
+                    choices=[(n, k) for n, k in DOMAIN_CHOICES],
+                    value="general",
+                    label="📚 领域（微调 Prompt）",
+                    scale=1,
+                )
+                trial_pages_dd = gr.Dropdown(
+                    choices=[(n, v) for n, v in TRIAL_PAGE_CHOICES],
+                    value=5,
+                    label="🧪 试翻页数",
+                    scale=1,
+                )
+
+            # ★ 新增：自定义 Prompt
+            extra_prompt_tb = gr.Textbox(
+                label="📝 自定义要求（追加到系统提示词，可留空）",
+                lines=2,
+                placeholder="例如：术语要统一；保留原文的人名不译；专业术语首次出现时加括号注原文",
+            )
+
             with gr.Row(equal_height=True):
                 want_terms_cb = gr.Checkbox(
                     label="📓 生成术语表与阅读笔记",
@@ -3868,7 +4315,7 @@ with gr.Blocks(
                     scale=1,
                 )
                 trial = gr.Checkbox(
-                    label="🧪 试翻（PDF 只翻前 5 页）",
+                    label="🧪 试翻（PDF 只翻指定页数）",
                     value=False,
                     elem_id="trial_cb",
                     scale=1,
@@ -3890,7 +4337,20 @@ with gr.Blocks(
             open_hint = gr.Markdown(value="", elem_id="open_hint")
 
         with gr.Column(scale=1, min_width=440, elem_id="status_col"):
-            gr.HTML('<div class="section-title">📋 任务列表</div>')
+            # ★ 新增：任务列表筛选
+            with gr.Row(equal_height=True):
+                gr.HTML('<div class="section-title" style="flex:1;'
+                        'border-bottom:none;padding-bottom:0;margin-bottom:0">'
+                        '📋 任务列表</div>')
+                task_filter_radio = gr.Radio(
+                    choices=[(n, k) for n, k in TASK_FILTER_CHOICES],
+                    value="all",
+                    label="",
+                    show_label=False,
+                    container=False,
+                    elem_id="task_filter",
+                )
+
             task_list_html = gr.HTML(
                 value='<div style="padding:18px;color:#a9a49a;font-size:13px;'
                       'text-align:center">暂无任务</div>'
@@ -3912,7 +4372,6 @@ with gr.Blocks(
                     '📊 当前进度</div>')
             progress_bar = gr.HTML(value=make_progress_html(0, 1, "等待开始"))
 
-    # ================= 中部：任务日志（全宽） =================
     with gr.Column(elem_id="log_row"):
         gr.HTML('<div class="section-title">📋 任务日志</div>')
         log = gr.Textbox(
@@ -3923,7 +4382,6 @@ with gr.Blocks(
             elem_id="task_log",
         )
 
-    # ================= 下部：效果预览 / 下载文件（全宽 Tabs） =================
     with gr.Column(elem_id="preview_row"):
         with gr.Tabs():
             with gr.TabItem("👀 效果预览"):
@@ -3949,7 +4407,9 @@ with gr.Blocks(
         on_start,
         [api_key, model, doc_file, file_mode, trial, target_lang,
          reader_profile, want_terms_cb, font_dd, fontsize_dd,
-         pdf_quality_dd, make_bilingual_cb, stop_dd],
+         pdf_quality_dd, make_bilingual_cb,
+         domain_dd, extra_prompt_tb, trial_pages_dd,
+         stop_dd],
         full_outputs,
         concurrency_limit=3,
         concurrency_id="start",
@@ -3962,6 +4422,12 @@ with gr.Blocks(
                       concurrency_limit=None, concurrency_id="manual")
     open_btn.click(open_result_folder, None, [open_hint])
     load_btn.click(on_load_preview, None, [gallery, out_files])
+
+    # ★ 新增：任务筛选事件
+    task_filter_radio.change(
+        on_filter_change, [task_filter_radio], fast_outputs,
+        concurrency_limit=None, concurrency_id="filter",
+    )
 
     pdf_quality_dd.change(
         lambda name: f"💡 {PDF_QUALITY_PRESETS.get(name, {}).get('hint', '')}",
@@ -3983,7 +4449,7 @@ with gr.Blocks(
 # main
 # ============================================================
 
-def _find_free_port(start=7860, end=7899):   # ★ 优化：扩展端口搜索范围
+def _find_free_port(start=7860, end=7869):
     for p in range(start, end + 1):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -3996,7 +4462,7 @@ def _find_free_port(start=7860, end=7899):   # ★ 优化：扩展端口搜索�
 
 
 if __name__ == "__main__":
-    PORT = _find_free_port(7860, 7899)
+    PORT = _find_free_port(7860, 7869)
     URL = "http://127.0.0.1:" + str(PORT)
 
     try:
@@ -4040,6 +4506,9 @@ if __name__ == "__main__":
     print(f"   双语 PDF 质量预设：{len(PDF_QUALITY_PRESETS)} 档")
     for _name, _cfg in PDF_QUALITY_PRESETS.items():
         print(f"      · {_name}（zoom={_cfg['zoom']}, JPEG={_cfg['jpeg']}）")
+
+    print(f"   领域数量：{len(DOMAIN_CHOICES)}（支持自定义 Prompt）")
+    print(f"   试翻页数：{', '.join(str(v) for _, v in TRIAL_PAGE_CHOICES)}")
 
     if not HAS_OFFICE:
         print("   [!] 未装 python-docx / python-pptx，Word / PPT 不可用")
