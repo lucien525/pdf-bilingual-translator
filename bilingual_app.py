@@ -957,9 +957,11 @@ def build_preview_html(preview_imgs, preview_html=None):
 
     if not preview_imgs:
         return '''
-        <div style="padding:60px 24px;color:#8b8578;text-align:center;font-size:13.5px;
+        <div style="padding:48px 24px;color:#8b8578;text-align:center;font-size:13.5px;
                     background:#fdfcf9;border:1.5px dashed #ebe5d8;border-radius:16px;
-                    line-height:1.9">
+                    line-height:1.9;min-height:300px;
+                    display:flex;flex-direction:column;
+                    align-items:center;justify-content:center">
             <div style="font-size:36px;margin-bottom:12px;opacity:.4">📄</div>
             <div style="color:#5a5a5a;font-weight:500">暂无预览</div>
             <div style="font-size:12px;color:#a9a49a;margin-top:6px">
@@ -3822,14 +3824,15 @@ except Exception:
 # ============================================================
 # UI
 # ============================================================
-with gr.Blocks(
-    title="PDF / Word / PPT 翻译器",
-    theme=gr.themes.Base(
-        primary_hue=gr.themes.colors.gray,
-        neutral_hue=gr.themes.colors.gray,
-        font=[gr.themes.GoogleFont("Noto Sans SC"), "system-ui", "sans-serif"],
-    ),
-    css="""
+UI_THEME = gr.themes.Base(
+    primary_hue=gr.themes.colors.gray,
+    neutral_hue=gr.themes.colors.gray,
+    font=[gr.themes.GoogleFont("Noto Sans SC"), "system-ui", "sans-serif"],
+)
+
+# ★ 修复：Gradio 6 中 css / theme 必须传给 launch()，
+# 放在 Blocks() 里会被忽略（旧版写法导致样式一直不生效）
+UI_CSS = """
     body, .gradio-container {
         background: #faf8f2 !important;
         color: #1a1a1a !important;
@@ -3878,50 +3881,11 @@ with gr.Blocks(
         display: flex; align-items: center; gap: 8px;
     }
 
-    #main_row {
-        gap: 18px !important;
-        align-items: stretch !important;
-    }
-    #main_row > .gr-column,
-    #main_row > div {
-        flex: 1 1 0 !important;
-        min-width: 0 !important;
-    }
-    #setup_col, #status_col {
-        background: #ffffff !important;
-        border: 1px solid #ebe5d8 !important;
-        border-radius: 18px !important;
-        padding: 22px 24px !important;
-        box-shadow: 0 3px 14px rgba(15,61,62,.05);
-        display: flex !important;
-        flex-direction: column !important;
-        min-height: 620px;
-    }
-    #status_col { background: #fdfcf8 !important; }
+    /* 分组标题已并入各长条面板的标题栏 */
 
-    @media (max-width: 960px) {
-        #main_row > .gr-column,
-        #main_row > div { min-width: 100% !important; }
-        #setup_col, #status_col { min-height: auto; }
-    }
+    /* 布局为全宽长条堆叠，无需左右两栏 */
 
-    #log_row {
-        margin-top: 18px !important;
-        background: #ffffff !important;
-        border: 1px solid #ebe5d8 !important;
-        border-radius: 18px !important;
-        padding: 22px 24px !important;
-        box-shadow: 0 3px 14px rgba(15,61,62,.05);
-    }
-
-    #preview_row {
-        margin-top: 18px !important;
-        background: #ffffff !important;
-        border: 1px solid #ebe5d8 !important;
-        border-radius: 18px !important;
-        padding: 22px 24px !important;
-        box-shadow: 0 3px 14px rgba(15,61,62,.05);
-    }
+    /* 底部日志 / 预览 / 下载已改用可折叠面板（.sec-fold） */
 
     label span, .gr-box > label > span {
         color: #1a1a1a !important;
@@ -3944,11 +3908,7 @@ with gr.Blocks(
         background: transparent !important;
         border: none !important;
     }
-    #setup_col .block, #status_col .block,
-    #log_row .block, #preview_row .block {
-        border: none !important;
-        box-shadow: none !important;
-    }
+    /* 分组样式统一由 .sec-fold 长条控制 */
 
     #file_mode { padding: 4px 0 !important; }
     #file_mode .wrap, #file_mode > div > div {
@@ -4016,7 +3976,7 @@ with gr.Blocks(
     #action_grid .gr-row,
     #action_grid .row {
         display: grid !important;
-        grid-template-columns: 1fr 1fr !important;
+        grid-template-columns: 1fr 1fr 1fr !important;
         gap: 10px !important;
         margin: 0 !important;
     }
@@ -4028,23 +3988,13 @@ with gr.Blocks(
     #action_grid button {
         width: 100% !important;
         height: 46px !important;
-        font-size: 14px !important;
+        font-size: 13.5px !important;
         font-weight: 600 !important;
         border-radius: 10px !important;
         letter-spacing: .3px;
         transition: transform .08s, box-shadow .15s, background .15s;
     }
     #action_grid button:hover { transform: translateY(-1px); }
-    #action_grid .primary {
-        background: linear-gradient(135deg, #0f3d3e, #1f5b5c) !important;
-        color: #faf8f2 !important;
-        border: none !important;
-        box-shadow: 0 3px 12px rgba(15,61,62,.28);
-    }
-    #action_grid .primary:hover {
-        background: linear-gradient(135deg, #0a2e2f, #0f3d3e) !important;
-        box-shadow: 0 5px 16px rgba(15,61,62,.38);
-    }
     #action_grid .secondary {
         background: #f5f1e6 !important; color: #0f3d3e !important;
         border: 1px solid #e2dccb !important;
@@ -4052,6 +4002,20 @@ with gr.Blocks(
     #action_grid .secondary:hover {
         background: #ebe5d5 !important;
         border-color: #c9a961 !important;
+    }
+    #start_btn {
+        height: 54px !important;
+        font-size: 16px !important;
+        font-weight: 700 !important;
+        letter-spacing: 1.5px;
+        background: linear-gradient(135deg, #0f3d3e, #1f5b5c) !important;
+        color: #faf8f2 !important;
+        border: none !important;
+        box-shadow: 0 4px 14px rgba(15,61,62,.3);
+    }
+    #start_btn:hover {
+        background: linear-gradient(135deg, #0a2e2f, #0f3d3e) !important;
+        box-shadow: 0 6px 18px rgba(15,61,62,.4);
     }
 
     #stop_one_row {
@@ -4070,6 +4034,38 @@ with gr.Blocks(
     #stop_one_btn:hover {
         background: linear-gradient(135deg, #6b2222, #4a1414) !important;
         transform: translateY(-1px);
+    }
+
+    #task_head_row {
+        gap: 10px !important; align-items: center !important;
+        justify-content: space-between !important;
+    }
+    #task_list {
+        flex: 1 1 auto !important;
+        min-height: 260px !important;
+        max-height: 520px !important;
+        overflow-y: auto !important;
+        margin: 2px 0 0 0 !important;
+    }
+    #task_filter .wrap {
+        display: flex !important; flex-wrap: wrap !important;
+        gap: 6px !important; justify-content: flex-end !important;
+    }
+    #task_filter label {
+        font-size: 12px !important; font-weight: 500 !important;
+        color: #5a5a5a !important; background: #f5f1e6 !important;
+        border: 1px solid #e2dccb !important;
+        border-radius: 999px !important; padding: 4px 12px !important;
+        cursor: pointer !important; margin: 0 !important;
+        transition: background .15s, color .15s, border-color .15s;
+    }
+    #task_filter label.selected {
+        background: #0f3d3e !important; color: #fff !important;
+        border-color: #0f3d3e !important;
+    }
+    #task_filter input[type="radio"] {
+        width: 14px !important; height: 14px !important;
+        accent-color: #0f3d3e !important;
     }
 
     #task_log textarea {
@@ -4092,6 +4088,7 @@ with gr.Blocks(
         border: none !important;
     }
 
+    #preview_box { min-height: 300px !important; }
     #preview_box::-webkit-scrollbar { width: 10px; }
     #preview_box::-webkit-scrollbar-track {
         background: #e8e1cc; border-radius: 5px;
@@ -4100,11 +4097,37 @@ with gr.Blocks(
         background: #c9a961; border-radius: 5px;
     }
 
-    .gradio-container .accordion-header {
-        background: #f5f1e6 !important; color: #0f3d3e !important;
-        font-size: 14px !important; font-weight: 500 !important;
-        border-radius: 12px !important;
+    /* 全宽长条：每个功能分组 = 一条可折叠面板 */
+    .sec-fold {
         border: 1px solid #ebe5d8 !important;
+        border-radius: 14px !important;
+        background: #ffffff !important;
+        box-shadow: 0 3px 14px rgba(15,61,62,.05);
+        margin-top: 12px !important;
+        overflow: hidden !important;
+    }
+    .sec-fold > button.label-wrap {
+        width: 100% !important;
+        background: #f5f1e6 !important;
+        border: none !important;
+        padding: 14px 20px !important;
+        font-size: 14.5px !important;
+        font-weight: 600 !important;
+        color: #0f3d3e !important;
+        cursor: pointer !important;
+        display: flex !important; align-items: center !important;
+        gap: 8px !important;
+        font-family: "Noto Serif SC", Georgia, serif !important;
+        letter-spacing: .4px !important;
+        transition: background .15s !important;
+    }
+    .sec-fold > button.label-wrap:hover { background: #ebe5d5 !important; }
+    .sec-fold > button.label-wrap .icon {
+        margin-left: auto !important; color: #c9a961 !important;
+        font-size: 12px !important;
+    }
+    .sec-fold > [data-testid="accordion-content"] {
+        padding: 16px 20px 20px !important;
     }
     .gradio-container h3 {
         color: #0f3d3e !important; font-size: 18px !important;
@@ -4114,24 +4137,16 @@ with gr.Blocks(
         color: #1a1a1a !important;
     }
 
-    .gradio-container .tab-nav {
-        border-bottom: 2px solid #ebe5d8 !important;
-        margin-bottom: 12px !important;
+    #load_btn {
+        width: 100% !important; max-width: 420px !important;
+        height: 44px !important;
+        font-size: 13.5px !important; font-weight: 600 !important;
+        background: #f5f1e6 !important; color: #0f3d3e !important;
+        border: 1px solid #e2dccb !important; border-radius: 10px !important;
+        transition: background .15s, border-color .15s;
     }
-    .gradio-container .tab-nav button {
-        font-size: 14.5px !important; font-weight: 600 !important;
-        color: #8b8578 !important;
-        padding: 10px 22px !important;
-        border-radius: 10px 10px 0 0 !important;
-        transition: color .15s, background .15s;
-    }
-    .gradio-container .tab-nav button.selected {
-        color: #0f3d3e !important;
-        background: #f5f1e6 !important;
-    }
-    .gradio-container .tab-nav button:hover {
-        color: #0f3d3e !important;
-        background: #faf8f2 !important;
+    #load_btn:hover {
+        background: #ebe5d5 !important; border-color: #c9a961 !important;
     }
 
     #open_hint {
@@ -4151,7 +4166,7 @@ with gr.Blocks(
 
     #quality_hint {
         min-height: 0 !important;
-        margin: -10px 0 4px 0 !important;
+        margin: -6px 0 10px 0 !important;
     }
     #quality_hint p {
         font-size: 12px !important;
@@ -4160,7 +4175,10 @@ with gr.Blocks(
         padding: 0 4px !important;
         line-height: 1.5 !important;
     }
-    """,
+    """
+
+with gr.Blocks(
+    title="PDF / Word / PPT 翻译器",
 ) as demo:
 
     modal_html = gr.HTML(value="", elem_id="modal_host")
@@ -4204,176 +4222,181 @@ with gr.Blocks(
         </div>
         """)
 
-    with gr.Row(equal_height=False, elem_id="main_row"):
+    # ══════════════ 上：翻译设置（每类一条，全宽长条，可折叠） ══════════════
+    gr.HTML('<div class="section-title">⚙️ 翻译设置</div>')
 
-        with gr.Column(scale=1, min_width=440, elem_id="setup_col"):
-            gr.HTML('<div class="section-title">⚙️ 翻译设置</div>')
-
-            with gr.Row(equal_height=True):
-                api_key = gr.Textbox(
-                    label="🔑 DeepSeek API Key",
-                    type="password",
-                    placeholder="留空用 .env",
-                    scale=3,
-                )
-                model = gr.Dropdown(
-                    choices=["deepseek-chat", "deepseek-reasoner"],
-                    value=DEFAULT_MODEL,
-                    label="🧠 模型",
-                    scale=2,
-                    elem_id="model_dd",
-                )
-
-            target_lang = gr.Dropdown(
-                choices=[(v, k) for k, v in LANG_NAMES.items()],
-                value="zh-CN",
-                label="🌐 目标语言",
-                elem_id="lang_dd",
+    with gr.Accordion("① 🔑 API 设置", open=True, elem_classes="sec-fold"):
+        with gr.Row(equal_height=True):
+            api_key = gr.Textbox(
+                label="🔑 DeepSeek API Key",
+                type="password",
+                placeholder="留空用 .env",
+                scale=3,
+            )
+            model = gr.Dropdown(
+                choices=["deepseek-chat", "deepseek-reasoner"],
+                value=DEFAULT_MODEL,
+                label="🧠 模型",
+                scale=2,
+                elem_id="model_dd",
             )
 
+    with gr.Accordion("② 📂 上传文档", open=True, elem_classes="sec-fold"):
+        with gr.Row(equal_height=True):
             file_mode = gr.Radio(
                 choices=["📕 PDF 书籍", "📘 Word 文档", "📊 PPT 演示"],
                 value="📕 PDF 书籍",
                 label="📂 文档类型（仅参考，实际按后缀自动判断）",
                 elem_id="file_mode",
+                scale=1,
             )
             doc_file = gr.File(
                 label="📄 上传文档（.pdf / .docx / .pptx）",
                 file_types=[".pdf", ".docx", ".pptx"],
                 elem_id="pdf_upload",
+                scale=1,
             )
 
-            _font_choices = sorted(FONTS_MAP.keys())
-            with gr.Row(equal_height=True):
-                font_dd = gr.Dropdown(
-                    choices=_font_choices if _font_choices
-                            else ["(无可用字体，用内置宋体)"],
-                    value=_default_font_display() if _font_choices
-                          else "(无可用字体，用内置宋体)",
-                    label="🔤 正文字体（仅 PDF）",
-                    interactive=True,
-                    elem_id="font_dd",
-                    scale=3,
-                )
-                fontsize_dd = gr.Dropdown(
-                    choices=[(name, val) for name, val in FONT_SIZE_CHOICES],
-                    value=DEFAULT_FONT_SIZE,
-                    label="📏 字号上限",
-                    interactive=True,
-                    elem_id="fontsize_dd",
-                    scale=2,
-                )
-
-            with gr.Row(equal_height=True):
-                pdf_quality_dd = gr.Dropdown(
-                    choices=list(PDF_QUALITY_PRESETS.keys()),
-                    value=DEFAULT_PDF_QUALITY,
-                    label="🎨 双语 PDF 质量（仅 PDF）",
-                    interactive=True,
-                    elem_id="quality_dd",
-                    scale=3,
-                )
-                make_bilingual_cb = gr.Checkbox(
-                    label="生成左右对照双语 PDF",
-                    value=True,
-                    elem_id="bi_cb",
-                    scale=2,
-                )
-
-            quality_hint = gr.Markdown(
-                value=f"💡 {PDF_QUALITY_PRESETS[DEFAULT_PDF_QUALITY]['hint']}",
-                elem_id="quality_hint",
+    with gr.Accordion("③ 🌐 翻译设置", open=True, elem_classes="sec-fold"):
+        with gr.Row(equal_height=True):
+            target_lang = gr.Dropdown(
+                choices=[(v, k) for k, v in LANG_NAMES.items()],
+                value="zh-CN",
+                label="🌐 目标语言",
+                elem_id="lang_dd",
+                scale=1,
+            )
+            domain_dd = gr.Dropdown(
+                choices=[(n, k) for n, k in DOMAIN_CHOICES],
+                value="general",
+                label="📚 领域（微调 Prompt）",
+                scale=1,
             )
 
-            # ★ 新增：领域 + 试翻页数
-            with gr.Row(equal_height=True):
-                domain_dd = gr.Dropdown(
-                    choices=[(n, k) for n, k in DOMAIN_CHOICES],
-                    value="general",
-                    label="📚 领域（微调 Prompt）",
-                    scale=1,
-                )
-                trial_pages_dd = gr.Dropdown(
-                    choices=[(n, v) for n, v in TRIAL_PAGE_CHOICES],
-                    value=5,
-                    label="🧪 试翻页数",
-                    scale=1,
-                )
-
-            # ★ 新增：自定义 Prompt
-            extra_prompt_tb = gr.Textbox(
-                label="📝 自定义要求（追加到系统提示词，可留空）",
-                lines=2,
-                placeholder="例如：术语要统一；保留原文的人名不译；专业术语首次出现时加括号注原文",
+    with gr.Accordion("④ 🎨 PDF 排版（仅 PDF）", open=True,
+                      elem_classes="sec-fold"):
+        _font_choices = sorted(FONTS_MAP.keys())
+        with gr.Row(equal_height=True):
+            font_dd = gr.Dropdown(
+                choices=_font_choices if _font_choices
+                        else ["(无可用字体，用内置宋体)"],
+                value=_default_font_display() if _font_choices
+                      else "(无可用字体，用内置宋体)",
+                label="🔤 正文字体",
+                interactive=True,
+                elem_id="font_dd",
+                scale=3,
             )
+            fontsize_dd = gr.Dropdown(
+                choices=[(name, val) for name, val in FONT_SIZE_CHOICES],
+                value=DEFAULT_FONT_SIZE,
+                label="📏 字号上限",
+                interactive=True,
+                elem_id="fontsize_dd",
+                scale=2,
+            )
+            pdf_quality_dd = gr.Dropdown(
+                choices=list(PDF_QUALITY_PRESETS.keys()),
+                value=DEFAULT_PDF_QUALITY,
+                label="🎨 双语 PDF 质量",
+                interactive=True,
+                elem_id="quality_dd",
+                scale=3,
+            )
+            make_bilingual_cb = gr.Checkbox(
+                label="生成左右对照双语 PDF",
+                value=True,
+                elem_id="bi_cb",
+                scale=2,
+            )
+        quality_hint = gr.Markdown(
+            value=f"💡 {PDF_QUALITY_PRESETS[DEFAULT_PDF_QUALITY]['hint']}",
+            elem_id="quality_hint",
+        )
 
-            with gr.Row(equal_height=True):
-                want_terms_cb = gr.Checkbox(
-                    label="📓 生成术语表与阅读笔记",
-                    value=True,
-                    elem_id="terms_cb",
-                    scale=1,
-                )
-                trial = gr.Checkbox(
-                    label="🧪 试翻（PDF 只翻指定页数）",
-                    value=False,
-                    elem_id="trial_cb",
-                    scale=1,
-                )
-
+    with gr.Accordion("⑤ 📚 翻译选项", open=True, elem_classes="sec-fold"):
+        with gr.Row(equal_height=True):
+            want_terms_cb = gr.Checkbox(
+                label="📓 生成术语表与阅读笔记",
+                value=True,
+                elem_id="terms_cb",
+                scale=1,
+            )
+            trial = gr.Checkbox(
+                label="🧪 试翻（PDF 只翻指定页数）",
+                value=False,
+                elem_id="trial_cb",
+                scale=1,
+            )
+            trial_pages_dd = gr.Dropdown(
+                choices=[(n, v) for n, v in TRIAL_PAGE_CHOICES],
+                value=5,
+                label="🧪 试翻页数",
+                scale=1,
+            )
             reader_profile = gr.Textbox(
                 label="👤 读者背景（决定术语说明深浅，可留空）",
                 placeholder="例如：有 Python 基础，但没接触过机器学习",
                 lines=1,
+                scale=1,
             )
+        extra_prompt_tb = gr.Textbox(
+            label="📝 自定义要求（追加到系统提示词，可留空）",
+            lines=2,
+            placeholder="例如：术语要统一；保留原文的人名不译；专业术语首次出现时加括号注原文",
+        )
 
-            with gr.Column(elem_id="action_grid"):
-                with gr.Row(equal_height=True):
-                    btn = gr.Button("▶ 开始翻译", variant="primary")
-                    stop_btn = gr.Button("⏹ 全部停止", variant="secondary")
-                    refresh_btn = gr.Button("🔄 刷新", variant="secondary")
-                    open_btn = gr.Button("📁 打开目录", variant="secondary")
-
-            open_hint = gr.Markdown(value="", elem_id="open_hint")
-
-        with gr.Column(scale=1, min_width=440, elem_id="status_col"):
-            # ★ 新增：任务列表筛选
+    with gr.Accordion("🚀 开始任务", open=True, elem_classes="sec-fold"):
+        with gr.Column(elem_id="action_grid"):
+            btn = gr.Button("▶ 开始翻译", variant="primary",
+                            elem_id="start_btn")
             with gr.Row(equal_height=True):
-                gr.HTML('<div class="section-title" style="flex:1;'
-                        'border-bottom:none;padding-bottom:0;margin-bottom:0">'
-                        '📋 任务列表</div>')
-                task_filter_radio = gr.Radio(
-                    choices=[(n, k) for n, k in TASK_FILTER_CHOICES],
-                    value="all",
-                    label="",
-                    show_label=False,
-                    container=False,
-                    elem_id="task_filter",
-                )
+                stop_btn = gr.Button("⏹ 全部停止", variant="secondary")
+                refresh_btn = gr.Button("🔄 刷新", variant="secondary")
+                open_btn = gr.Button("📁 打开目录", variant="secondary")
+        open_hint = gr.Markdown(value="", elem_id="open_hint")
 
-            task_list_html = gr.HTML(
-                value='<div style="padding:18px;color:#a9a49a;font-size:13px;'
-                      'text-align:center">暂无任务</div>'
+    # ══════════════ 中：任务与进度（全宽长条，可折叠） ══════════════
+    gr.HTML('<div class="section-title" style="margin-top:28px">'
+            '📋 任务与进度</div>')
+
+    with gr.Accordion("📋 任务列表", open=True, elem_classes="sec-fold"):
+        with gr.Row(elem_id="task_head_row"):
+            gr.HTML('<div style="font-size:12px;color:#8b8578;'
+                    'align-self:center">状态筛选：</div>')
+            task_filter_radio = gr.Radio(
+                choices=[(n, k) for n, k in TASK_FILTER_CHOICES],
+                value="all",
+                label="",
+                show_label=False,
+                container=False,
+                elem_id="task_filter",
             )
+        task_list_html = gr.HTML(
+            value='<div style="padding:18px;color:#a9a49a;font-size:13px;'
+                  'text-align:center">暂无任务</div>',
+            elem_id="task_list",
+        )
 
-            gr.HTML('<div class="section-title" style="margin-top:18px">'
-                    '🛑 单独停止某个任务</div>')
-            with gr.Row(elem_id="stop_one_row"):
-                stop_dd = gr.Dropdown(
-                    label="选择要停止的任务（只列运行中）",
-                    choices=[],
-                    value=None,
-                    interactive=True,
-                    elem_id="stop_dd",
-                )
-                stop_one_btn = gr.Button("⏹ 停止选中", elem_id="stop_one_btn")
+    with gr.Accordion("🛑 停止任务", open=True, elem_classes="sec-fold"):
+        with gr.Row(elem_id="stop_one_row"):
+            stop_dd = gr.Dropdown(
+                label="选择要停止的任务（只列运行中）",
+                choices=[],
+                value=None,
+                interactive=True,
+                elem_id="stop_dd",
+            )
+            stop_one_btn = gr.Button("⏹ 停止选中", elem_id="stop_one_btn")
 
-            gr.HTML('<div class="section-title" style="margin-top:18px">'
-                    '📊 当前进度</div>')
-            progress_bar = gr.HTML(value=make_progress_html(0, 1, "等待开始"))
+    with gr.Accordion("📊 当前进度", open=True, elem_classes="sec-fold"):
+        progress_bar = gr.HTML(
+            value=make_progress_html(0, 1, "等待开始"),
+            elem_id="progress_host",
+        )
 
-    with gr.Column(elem_id="log_row"):
-        gr.HTML('<div class="section-title">📋 任务日志</div>')
+    # ══════════════ 中部：任务日志（可折叠） ══════════════
+    with gr.Accordion("📋 任务日志", open=True, elem_classes="sec-fold"):
         log = gr.Textbox(
             label="",
             lines=14,
@@ -4382,22 +4405,24 @@ with gr.Blocks(
             elem_id="task_log",
         )
 
-    with gr.Column(elem_id="preview_row"):
-        with gr.Tabs():
-            with gr.TabItem("👀 效果预览"):
-                gallery = gr.HTML(
-                    value=build_preview_html([]),
-                    elem_id="preview_box",
-                )
-                load_btn = gr.Button(
-                    "🔍 加载当前任务的预览图和下载文件",
-                    variant="secondary",
-                )
-            with gr.TabItem("💾 下载文件"):
-                out_files = gr.File(
-                    label="", file_count="multiple",
-                    interactive=False, show_label=False,
-                )
+    # ══════════════ 底部：效果预览（可折叠） ══════════════
+    with gr.Accordion("👀 效果预览", open=False, elem_classes="sec-fold"):
+        gallery = gr.HTML(
+            value=build_preview_html([]),
+            elem_id="preview_box",
+        )
+        load_btn = gr.Button(
+            "🔍 加载当前任务的预览图和下载文件",
+            variant="secondary",
+            elem_id="load_btn",
+        )
+
+    # ══════════════ 底部：下载文件（可折叠） ══════════════
+    with gr.Accordion("💾 下载文件", open=False, elem_classes="sec-fold"):
+        out_files = gr.File(
+            label="", file_count="multiple",
+            interactive=False, show_label=False,
+        )
 
     fast_outputs = [task_list_html, progress_bar, log, stop_dd, gallery, modal_html]
     full_outputs = [task_list_html, progress_bar, log, stop_dd,
@@ -4534,5 +4559,7 @@ if __name__ == "__main__":
         inbrowser=True,
         show_error=False,
         quiet=True,
+        css=UI_CSS,
+        theme=UI_THEME,
         allowed_paths=[os.path.abspath(RESULT_ROOT)],
     )
