@@ -243,8 +243,25 @@ Q10：翻译费用大概多少？
 ============================================================
 
   bilingual\
-  ├── bilingual_app.py       翻译器主程序
-  ├── homework_app.py        解题器主程序
+  ├── main.py                翻译器主程序入口
+  ├── ui.py                  翻译器界面（Gradio）
+  ├── core\                  翻译器核心模块
+  │   ├── config.py          配置 / 常量
+  │   ├── utils.py           路径 / JSON / 体积工具
+  │   ├── fonts.py           字体扫描
+  │   ├── tasks.py           任务管理与状态持久化
+  │   ├── api.py             提示词 + API 调用
+  │   ├── pdf_pipeline.py    PDF 翻译管线
+  │   ├── preview.py         预览 HTML
+  │   ├── notes.py           术语页 PDF
+  │   ├── office.py          Word / PPT 工具
+  │   └── workers.py         pdf / docx / pptx worker
+  ├── homework_app.py        解题器主程序入口
+  ├── hw_core.py             解题器：配置 / 工具 / 字体
+  ├── hw_preview.py          解题器：预览 HTML
+  ├── hw_solve.py            解题器：解题业务 / 公式渲染
+  ├── hw_tasks.py            解题器：任务管理 / worker
+  ├── hw_ui.py               解题器界面（Gradio）
   ├── notes_builder.py       翻译器：术语笔记生成器
   ├── test.py                字体检查工具
   ├── requirements.txt       依赖清单

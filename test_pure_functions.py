@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""纯函数测试：bilingual_app + homework_app（import 不会启动 Gradio）。
+"""纯函数测试：main + homework_app（import 不会启动 Gradio）。
 
 运行：python -m unittest test_pure_functions -v
 """
@@ -14,7 +14,8 @@ if _HERE not in sys.path:
 
 import pymupdf as fitz  # noqa: E402
 
-import bilingual_app as bi  # noqa: E402
+from core import utils as bi          # safe_dirname
+from core import pdf_pipeline as bip  # parse_marked / page_is_translated
 import homework_app as hw  # noqa: E402
 
 
@@ -42,21 +43,21 @@ class TestSafeDirname(unittest.TestCase):
 
 class TestParseMarked(unittest.TestCase):
     def test_normal(self):
-        self.assertEqual(bi.parse_marked("[[B0]] 你好\n\n[[B1]] world"),
+        self.assertEqual(bip.parse_marked("[[B0]] 你好\n\n[[B1]] world"),
                          {0: "你好", 1: "world"})
 
     def test_out_of_order(self):
-        self.assertEqual(bi.parse_marked("[[B2]] x\n[[B0]] y"),
+        self.assertEqual(bip.parse_marked("[[B2]] x\n[[B0]] y"),
                          {2: "x", 0: "y"})
 
     def test_duplicate_keeps_first(self):
-        self.assertEqual(bi.parse_marked("[[B0]] a\n[[B0]] b"), {0: "a"})
+        self.assertEqual(bip.parse_marked("[[B0]] a\n[[B0]] b"), {0: "a"})
 
     def test_empty(self):
-        self.assertEqual(bi.parse_marked(""), {})
+        self.assertEqual(bip.parse_marked(""), {})
 
     def test_no_markers(self):
-        self.assertEqual(bi.parse_marked("plain text"), {})
+        self.assertEqual(bip.parse_marked("plain text"), {})
 
 
 class TestParseSolutionResponse(unittest.TestCase):
@@ -112,23 +113,23 @@ class TestPageIsTranslated(unittest.TestCase):
         cls.doc.close()
 
     def test_chinese_page_is_translated(self):
-        self.assertTrue(bi.page_is_translated(self.p_cn, "zh-CN",
+        self.assertTrue(bip.page_is_translated(self.p_cn, "zh-CN",
                                               src_page=self.p_en))
 
     def test_english_page_not_translated_to_zh(self):
-        self.assertFalse(bi.page_is_translated(self.p_en, "zh-CN",
+        self.assertFalse(bip.page_is_translated(self.p_en, "zh-CN",
                                                src_page=self.p_cn))
 
     def test_blank_vs_blank(self):
-        self.assertTrue(bi.page_is_translated(self.p_blank, "zh-CN",
+        self.assertTrue(bip.page_is_translated(self.p_blank, "zh-CN",
                                               src_page=self.p_blank))
 
     def test_latin_target_always_true(self):
-        self.assertTrue(bi.page_is_translated(self.p_en, "en",
+        self.assertTrue(bip.page_is_translated(self.p_en, "en",
                                               src_page=self.p_cn))
 
     def test_no_src_page_true(self):
-        self.assertTrue(bi.page_is_translated(self.p_en, "zh-CN"))
+        self.assertTrue(bip.page_is_translated(self.p_en, "zh-CN"))
 
 
 if __name__ == "__main__":

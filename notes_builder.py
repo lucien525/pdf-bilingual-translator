@@ -2,7 +2,7 @@
 """
 notes_builder.py
 术语表 + 阅读笔记生成器（技术书专用）
-被 bilingual_app.py 引用，也可独立使用。
+被翻译器（main.py / core 模块）引用，也可独立使用。
 """
 
 import os

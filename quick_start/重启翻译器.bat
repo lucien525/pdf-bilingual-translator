@@ -100,7 +100,7 @@ if errorlevel 1 (
 echo [信息] conda 环境已激活，启动翻译器……
 echo.
 
-python bilingual_app.py
+python main.py
 
 if errorlevel 1 (
     echo.
